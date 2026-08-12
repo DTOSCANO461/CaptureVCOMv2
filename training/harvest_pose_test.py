@@ -120,12 +120,24 @@ def main():
             continue
 
         clase = random.choice(["hurto", "normal"])   # ALEATORIO, solo para probar la mecanica
-        nombre = f"{clase}__{os.path.basename(clip)}.npy"
+        nombre_clip = os.path.splitext(os.path.basename(clip))[0]
+        base = f"{clase}__{nombre_clip}"
         arr = tubo.permute(0, 2, 3, 1).cpu().numpy()   # T,C,H,W -> T,H,W,C, para que quede igual formato que el dataset viejo
-        np.save(os.path.join(args.out_dir, nombre), arr)
-        man.write(f"{nombre},{clase},{marco},{ventana},{os.path.basename(clip)}\n")
+        np.save(os.path.join(args.out_dir, base + ".npy"), arr)
+
+        # video de la zona de recorte, para validar visualmente que el tubo
+        # de verdad sigue a la persona -- mismo criterio (4fps) que los
+        # clips de alerta del resto del repo (guarda_alerta en main.py /
+        # los notebooks): 16 frames a 4fps = los ~4s de la ventana original.
+        video_path = os.path.join(args.out_dir, base + ".mp4")
+        h, w = arr.shape[1], arr.shape[2]
+        vw = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*"mp4v"), 4, (w, h))
+        for fr in arr:
+            vw.write(fr[:, :, ::-1])   # RGB -> BGR para escribir
+        vw.release()
+        man.write(f"{base}.npy,{clase},{marco},{ventana},{os.path.basename(clip)}\n")
         n_ok += 1
-        print(f"  [ok]   {os.path.basename(clip)} -> {nombre}  marco={marco}  ventana={ventana}  tubo={arr.shape}")
+        print(f"  [ok]   {os.path.basename(clip)} -> {base}.npy (+.mp4)  marco={marco}  ventana={ventana}  tubo={arr.shape}")
 
     man.close()
     print(f"\n{n_ok} tubos generados, {n_skip} saltados -> {args.out_dir}")
