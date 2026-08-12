@@ -35,16 +35,18 @@ NUM_CLASES = 70
 # ────────────────────────── datos ──────────────────────────
 
 def load_index():
-    """Lee ROOT/anotaciones.csv -- UNA sola tabla (npy,clase,split,...), la que
-    genera training/harvest_pose_test.py (o su version real una vez que haya
-    labels de verdad, mismo esquema). Reemplaza el join labels.csv/tubes_meta.csv
-    del dataset viejo -- ya no aplica, el dataset nuevo no se genera asi."""
+    """Lee ROOT/anotaciones.csv -- UNA sola tabla (npy,label,split,...), la que
+    genera training/harvest_pose_test.py / harvest_muestra.py. Reemplaza el
+    join labels.csv/tubes_meta.csv del dataset viejo -- ya no aplica.
+
+    "label" es el codigo numerico multi-clase de labeling_strategy.py
+    (0-69), NO el binario hurto/normal de antes."""
     rows = list(csv.DictReader(open(f"{ROOT}/anotaciones.csv")))
     items = []
     for r in rows:
         if not r.get("npy"):
             continue
-        items.append({"npy": os.path.join(ROOT, "tubes", r["npy"]), "clase": r["clase"], "split": r["split"]})
+        items.append({"npy": os.path.join(ROOT, "tubes", r["npy"]), "label": int(r["label"]), "split": r["split"]})
     return items
 
 
@@ -158,7 +160,7 @@ class TubeDataset(Dataset):
                 x = x.mean(0, keepdim=True).repeat(3, 1, 1, 1)    # gris
             x = x.clamp(0, 1)
         x = (x - self.mean) / self.std
-        y = 1 if it["clase"] == "hurto" else 0
+        y = it["label"]
         return x, y
 
 
@@ -199,20 +201,27 @@ def build_model(name):
 # ────────────────────────── entrenamiento ──────────────────────────
 
 def evaluate(model, loader, device):
+    """Multiclase (hasta NUM_CLASES): accuracy + F1 ponderado por soporte
+    (weighted, no macro -- con 500 tubos repartidos en ~70 clases muchas
+    tienen 1-2 muestras en val, macro les daria el mismo peso que a las
+    clases grandes y el numero saldria dominado por ruido). Devuelve tambien
+    ys/preds/probs crudos para poder graficar matriz de confusion despues."""
     model.eval()
-    ys, ps = [], []
+    ys, preds, probs = [], [], []
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
         for x, y in loader:
             x = x.to(device, non_blocking=True)
             logits = model(x)
-            p = torch.softmax(logits.float(), 1)[:, 1]
+            p = torch.softmax(logits.float(), 1)
             ys += y.tolist()
-            ps += p.cpu().tolist()
-    from sklearn.metrics import roc_auc_score, average_precision_score
-    ys_a, ps_a = np.array(ys), np.array(ps)
-    auc = roc_auc_score(ys_a, ps_a) if len(set(ys)) > 1 else float("nan")
-    ap = average_precision_score(ys_a, ps_a) if len(set(ys)) > 1 else float("nan")
-    return auc, ap, ys_a, ps_a
+            preds += p.argmax(1).cpu().tolist()
+            probs.append(p.cpu())
+    from sklearn.metrics import accuracy_score, f1_score
+    ys_a, preds_a = np.array(ys), np.array(preds)
+    acc = accuracy_score(ys_a, preds_a) if len(ys_a) else float("nan")
+    f1 = f1_score(ys_a, preds_a, average="weighted", zero_division=0) if len(ys_a) else float("nan")
+    probs_a = torch.cat(probs).numpy() if probs else np.zeros((0, NUM_CLASES))
+    return acc, f1, ys_a, preds_a, probs_a
 
 
 def main():
@@ -233,19 +242,25 @@ def main():
     os.makedirs(run_dir, exist_ok=True)
 
     items = load_index()
-    tr = [i for i in items if i["split"] == "train" and i["clase"] in ("hurto", "normal")]
-    va = [i for i in items if i["split"] == "val" and i["clase"] in ("hurto", "normal")]
-    print(f"train {len(tr)} (hurto {sum(1 for i in tr if i['clase']=='hurto')}) | val {len(va)}")
+    tr = [i for i in items if i["split"] == "train"]
+    va = [i for i in items if i["split"] == "val"]
+    n_clases_tr = len(set(i["label"] for i in tr))
+    print(f"train {len(tr)} ({n_clases_tr} clases distintas) | val {len(va)}")
 
     model, mean, std = build_model(args.model)
     model.to(device)
 
     ds_tr = TubeDataset(tr, True, mean, std)
     ds_va = TubeDataset(va, False, mean, std)
-    # sampler balanceado
-    n_h = sum(1 for i in tr if i["clase"] == "hurto")
-    n_n = len(tr) - n_h
-    wts = [1.0/n_h if i["clase"] == "hurto" else 1.0/n_n for i in tr]
+    # sampler balanceado POR CLASE (antes binario hurto/normal): peso
+    # inversamente proporcional al conteo de esa clase en train, asi las
+    # clases chicas (algunas con 1-2 tubos en una muestra de 500) no quedan
+    # invisibles frente a las grandes (ej. label 48, que junta control_negativo
+    # Y doblar_sobreponer Y varios "no_obvio").
+    conteo_clase = {}
+    for i in tr:
+        conteo_clase[i["label"]] = conteo_clase.get(i["label"], 0) + 1
+    wts = [1.0 / conteo_clase[i["label"]] for i in tr]
     sampler = WeightedRandomSampler(wts, num_samples=len(tr), replacement=True)
     dl_tr = DataLoader(ds_tr, batch_size=args.bs, sampler=sampler,
                        num_workers=args.workers, pin_memory=True, drop_last=True,
@@ -255,12 +270,31 @@ def main():
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.05)
     steps_ep = len(dl_tr) // args.accum
+    # OneCycleLR con total_steps chico puede caer justo en un limite entero
+    # (ej. total_steps=10, pct_start=0.1 -> 0.1*10=1.0 -> la fase de warmup
+    # queda con end_step==start_step==0 -> ZeroDivisionError en el
+    # constructor mismo). Piso de 20 pasos evita esa condicion para
+    # pct_start=0.1 (hace falta pct_start*total_steps >= 2 para que la
+    # primera fase tenga al menos 1 paso de ancho) -- visto en vivo con
+    # exactamente 359 tubos, ver commit del bug.
+    total_steps = max(steps_ep * args.epochs, 20)
     sched = torch.optim.lr_scheduler.OneCycleLR(
-        opt, max_lr=args.lr, total_steps=max(1, steps_ep*args.epochs), pct_start=0.1)
+        opt, max_lr=args.lr, total_steps=total_steps, pct_start=0.1)
     scaler = torch.amp.GradScaler()
     crit = nn.CrossEntropyLoss(label_smoothing=0.05)
 
-    best_auc, log = 0.0, []
+    # Baseline: metricas del modelo SIN entrenar (cabeza de NUM_CLASES recien
+    # inicializada al azar sobre el backbone preentrenado en Kinetics) -- se
+    # loguea como "ep": 0, antes de que corra ninguna epoca de entrenamiento,
+    # para poder comparar contra esto en las graficas despues.
+    log = []
+    print("evaluando modelo BASE (sin entrenar) para tener una referencia...", flush=True)
+    acc0, f1_0, _, _, _ = evaluate(model, dl_va, device)
+    print(f"ep 0/{args.epochs} (BASELINE, sin entrenar)  val_acc {acc0:.4f}  val_f1 {f1_0:.4f}", flush=True)
+    log.append({"ep": 0, "loss": None, "val_acc": float(acc0), "val_f1": float(f1_0), "min": 0.0})
+    json.dump(log, open(os.path.join(run_dir, "log.json"), "w"), indent=1)
+
+    best_f1 = f1_0
     for ep in range(args.epochs):
         model.train()
         t0, losses = time.time(), []
@@ -277,20 +311,20 @@ def main():
                 scaler.update()
                 opt.zero_grad(set_to_none=True)
                 sched.step()
-        auc, ap_, _, _ = evaluate(model, dl_va, device)
+        acc, f1, _, _, _ = evaluate(model, dl_va, device)
         dt = time.time() - t0
         print(f"ep {ep+1}/{args.epochs} loss {np.mean(losses):.4f} "
-              f"val_auc {auc:.4f} val_ap {ap_:.4f} ({dt/60:.1f} min)", flush=True)
+              f"val_acc {acc:.4f} val_f1 {f1:.4f} ({dt/60:.1f} min)", flush=True)
         log.append({"ep": ep+1, "loss": float(np.mean(losses)),
-                    "val_auc": float(auc), "val_ap": float(ap_), "min": dt/60})
+                    "val_acc": float(acc), "val_f1": float(f1), "min": dt/60})
         torch.save(model.state_dict(), os.path.join(run_dir, "last.pt"))
-        if auc >= best_auc:
-            best_auc = auc
+        if f1 >= best_f1:
+            best_f1 = f1
             torch.save(model.state_dict(), os.path.join(run_dir, "best.pt"))
-            print(f"  → best ({auc:.4f})", flush=True)
+            print(f"  → best ({f1:.4f})", flush=True)
         json.dump(log, open(os.path.join(run_dir, "log.json"), "w"), indent=1)
 
-    print(f"FIN {args.model}: best val AUC {best_auc:.4f}")
+    print(f"FIN {args.model}: baseline val_f1 {f1_0:.4f} -> best val_f1 {best_f1:.4f}")
 
 
 if __name__ == "__main__":
