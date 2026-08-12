@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 """harvest_muestra.py -- cosecha una MUESTRA ALEATORIA de N videos tomados
 de VARIAS carpetas de videos_for_train/ (a diferencia de harvest_pose_test.py,
-que procesa una sola carpeta a la vez). Reusa toda la logica de extraccion,
-etiquetado y resumibilidad de harvest_pose_test.py -- este script solo arma
-el pool multi-carpeta, hace el sorteo, y agrega dataset_tipo a la tabla.
+que procesa una sola carpeta a la vez). Reusa toda la logica de extraccion y
+resumibilidad de harvest_pose_test.py -- este script solo arma el pool
+multi-carpeta, hace el sorteo, y agrega dataset_tipo a la tabla.
 
-Carpetas EXCLUIDAS del sorteo: manipulaciones_tiendas, reingesta_dia1_socrates,
-reingesta_dia_platonv1 -- labeling_strategy.py todavia no tiene reglas de
-etiquetado para esas, aplica_reglas_etiquetado() se detendria ahi mismo.
+YA NO resuelve labels aca (ver harvest_pose_test.py y
+training/genera_anotaciones_por_cabeza.py) -- por eso TODAS las carpetas de
+videos_for_train/ entran al sorteo, incluidas manipulaciones_tiendas/
+reingesta_dia1_socrates/reingesta_dia_platonv1 (antes CARPETAS_EXCLUIDAS
+porque labeling_strategy.aplica_reglas_etiquetado() no tiene reglas
+multiclase para esas y se hubiera detenido en seco; eso ya no aplica aca,
+solo le importa a quien resuelva el label multiclase despues -- esas 3
+carpetas van a quedar sin label multiclase valido, pero SI tienen uno
+binario, ver labeling_strategy_binaria.py). Unica condicion real para
+entrar al sorteo: que dataset_tipo tenga FPS conocido (ls.fps_de_carpeta),
+eso no depende de la cabeza.
 
 Uso:
   python3 training/harvest_muestra.py <videos_for_train_dir> <out_dir> [--n 500] [--seed 0]
@@ -26,8 +34,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harvest_pose_test as hpt
 import labeling_strategy as ls
 from ultralytics import YOLO
-
-CARPETAS_EXCLUIDAS = {"manipulaciones_tiendas", "reingesta_dia1_socrates", "reingesta_dia_platonv1"}
 
 
 def clips_ya_procesados_multi(anotaciones_path):
@@ -56,10 +62,9 @@ def main():
 
     carpetas = sorted(
         d for d in os.listdir(args.videos_for_train_dir)
-        if os.path.isdir(os.path.join(args.videos_for_train_dir, d)) and d not in CARPETAS_EXCLUIDAS
+        if os.path.isdir(os.path.join(args.videos_for_train_dir, d))
     )
     print(f"carpetas incluidas en el sorteo ({len(carpetas)}): {carpetas}")
-    print(f"carpetas EXCLUIDAS (sin reglas de labeling todavia): {sorted(CARPETAS_EXCLUIDAS)}")
 
     anot_path = os.path.join(args.out_dir, "anotaciones.csv")
     ya_procesados = clips_ya_procesados_multi(anot_path)   # (dataset_tipo, clip_origen) de una corrida anterior -- AJUSTA EL POOL DE SORTEO, no solo el skip
@@ -86,7 +91,10 @@ def main():
     anot = open(anot_path, "a" if ya_procesados or os.path.exists(anot_path) else "w", newline="")
     escritor = csv.writer(anot)
     if not ya_procesados and anot.tell() == 0:
-        escritor.writerow(["npy", "label", "split", "marco", "x0", "y0", "x1", "y1",
+        # SIN "label" -- ver docstring del modulo y de harvest_pose_test.py:
+        # se resuelve a posteriori (training/genera_anotaciones_por_cabeza.py)
+        # a partir de dataset_tipo+clip_origen, ya en esta misma tabla.
+        escritor.writerow(["npy", "split", "marco", "x0", "y0", "x1", "y1",
                             "fps", "dataset_tipo", "clip_origen"])
         anot.flush()
 
@@ -101,8 +109,6 @@ def main():
 
         try:
             tubo, ventana, total_frames = hpt.extrae_tubo(modelo_pose, clip, marco, fps)
-        except (ls.DatasetTipoDesconocido, ls.LabelNoResuelto):
-            raise   # ADVERTENCIA + PAUSA real: no se atrapa
         except Exception as e:
             print("ERR", clip, e)
             tubo = None
@@ -111,17 +117,8 @@ def main():
             print(f"  [skip] ({dataset_tipo}) {nombre_base_clip} -- sin keypoints validos")
             continue
 
-        results = {
-            "frame_dir": nombre_base_clip,
-            "dataset_tipo": dataset_tipo,
-            "label": ls.extraer_label_inicial(nombre_base_clip),
-            "total_frames": total_frames,
-        }
-        ls.aplica_reglas_etiquetado(results)
-        label = results["label"]
-
         split = "val" if random.random() < args.val_frac else "train"
-        base = hpt.nombre_seguro(f"L{label:02d}__{dataset_tipo}__{nombre_clip}")
+        base = hpt.nombre_seguro(f"{dataset_tipo}__{nombre_clip}")
         arr = tubo.permute(0, 2, 3, 1).cpu().numpy()
 
         try:
@@ -145,11 +142,11 @@ def main():
             raise
 
         x0, y0, x1, y1 = ventana
-        escritor.writerow([f"{base}.npy", label, split, marco, x0, y0, x1, y1, fps, dataset_tipo, nombre_base_clip])
+        escritor.writerow([f"{base}.npy", split, marco, x0, y0, x1, y1, fps, dataset_tipo, nombre_base_clip])
         anot.flush()
         os.fsync(anot.fileno())
         n_ok += 1
-        print(f"  [ok]   ({dataset_tipo}) {nombre_base_clip} -> {base}.npy  label={label}  split={split}  tubo={arr.shape}")
+        print(f"  [ok]   ({dataset_tipo}) {nombre_base_clip} -> {base}.npy  split={split}  tubo={arr.shape}")
 
     anot.close()
     print(f"\n{n_ok} tubos generados, {n_skip} saltados, {n_saltados_ya} ya estaban de una corrida "

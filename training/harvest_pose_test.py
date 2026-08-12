@@ -29,10 +29,18 @@ Lo que cambia respecto a harvest_v14.py:
     keypoints validos de la ventana, marco proporcional) +
     recorta_y_redimensiona_gpu (UN solo resize, torch, nearest) en vez de
     make_tube (crop por deteccion + cv2.resize INTER_AREA).
-  - Labels: numerico multi-clase (labeling_strategy.py), no hurto/normal --
-    ver el docstring de ese modulo. Si una carpeta no tiene reglas de
-    etiquetado, o si el label queda sin resolver, el script SE DETIENE
-    (no se atrapa esa excepcion) -- es la validacion que se pidio.
+  - Labels: YA NO SE RESUELVEN ACA. anotaciones.csv guarda dataset_tipo +
+    clip_origen (crudos) pero NINGUNA columna "label" -- no sabemos todavia,
+    al cosechar, si el entrenamiento final va a ser binario o multiclase
+    (labeling_strategy_binaria.py vs labeling_strategy.py resuelven
+    distinto, y algunas carpetas -- reingesta_*, manipulaciones_tiendas --
+    solo son resolubles para binario, no para multiclase). Resolver el
+    label a posteriori, a partir de dataset_tipo+clip_origen (alcanza con
+    esos dos campos, ya estan en la tabla), es
+    training/genera_anotaciones_por_cabeza.py -- corre sobre el .npy YA
+    cosechado, sin volver a tocar video. fps_de_carpeta() SI se sigue
+    llamando aca (una vez, al arrancar): si dataset_tipo no tiene FPS
+    conocido, no hay forma de cosechar nada, eso no depende de la cabeza.
 
 Uso:
   python3 training/harvest_pose_test.py <carpeta_videos> <out_dir> [--pose-model PATH]
@@ -182,12 +190,14 @@ def main():
     clips = sorted(glob.glob(os.path.join(args.carpeta_videos, "*.mp4")))
     print(f"{len(clips)} clips en {args.carpeta_videos}")
 
-    # anotaciones.csv: UNA sola tabla (npy,label,split,marco,ventana,fps,clip_origen).
-    # "label" es el codigo numerico multi-clase de labeling_strategy.py (NO
-    # hurto/normal -- ver el docstring de ese modulo). "split" sigue siendo
-    # un sorteo simple (ALEATORIO) -- para el dataset real conviene separar
-    # por clip/dia/camara de origen, no al azar por tubo, para no filtrar el
-    # mismo evento entre train y val.
+    # anotaciones.csv CRUDO: npy,split,marco,x0,y0,x1,y1,fps,clip_origen --
+    # SIN "label" (ver docstring del modulo: se resuelve a posteriori, con
+    # training/genera_anotaciones_por_cabeza.py, porque dataset_tipo ya esta
+    # en la tabla -- ver harvest_muestra.py, que agrega esa columna -- y
+    # clip_origen alcanza para recalcular cualquier label sin volver a tocar
+    # video). "split" sigue siendo un sorteo simple (ALEATORIO) -- para el
+    # dataset real conviene separar por clip/dia/camara de origen, no al
+    # azar por tubo, para no filtrar el mismo evento entre train y val.
     print("AVISO: split en anotaciones.csv es un sorteo -- todavia no se separa por dia/camara de origen")
 
     anot_path = os.path.join(args.out_dir, "anotaciones.csv")
@@ -201,7 +211,7 @@ def main():
     # en 4 columnas (x0,y0,x1,y1) en vez de una tupla-string.
     escritor = csv.writer(anot)
     if not ya_procesados and anot.tell() == 0:
-        escritor.writerow(["npy", "label", "split", "marco", "x0", "y0", "x1", "y1", "fps", "clip_origen"])
+        escritor.writerow(["npy", "split", "marco", "x0", "y0", "x1", "y1", "fps", "clip_origen"])
         anot.flush()
 
     n_ok = n_skip = n_saltados_ya = 0
@@ -215,8 +225,6 @@ def main():
 
         try:
             tubo, ventana, total_frames = extrae_tubo(modelo_pose, clip, marco, fps)
-        except (ls.DatasetTipoDesconocido, ls.LabelNoResuelto):
-            raise   # ADVERTENCIA + PAUSA real: no se atrapa, se detiene todo el script
         except Exception as e:
             print("ERR", clip, e)
             tubo = None
@@ -225,17 +233,8 @@ def main():
             print(f"  [skip] {os.path.basename(clip)} -- sin keypoints validos")
             continue
 
-        results = {
-            "frame_dir": os.path.basename(clip),
-            "dataset_tipo": dataset_tipo,
-            "label": ls.extraer_label_inicial(os.path.basename(clip)),
-            "total_frames": total_frames,
-        }
-        ls.aplica_reglas_etiquetado(results)   # in-place; puede raise DatasetTipoDesconocido/LabelNoResuelto (sin atrapar, ver arriba)
-        label = results["label"]
-
         split = "val" if random.random() < args.val_frac else "train"   # ALEATORIO, ver aviso arriba
-        base = nombre_seguro(f"L{label:02d}__{nombre_clip}")
+        base = nombre_seguro(f"{dataset_tipo}__{nombre_clip}")
         arr = tubo.permute(0, 2, 3, 1).cpu().numpy()   # T,C,H,W -> T,H,W,C, mismo formato que el dataset viejo
 
         try:
@@ -266,11 +265,11 @@ def main():
         # Python/OS -- si el proceso muere (disco lleno, kill -9, corte de luz)
         # en el clip siguiente, esta fila no se pierde y el retomado no la repite.
         x0, y0, x1, y1 = ventana
-        escritor.writerow([f"{base}.npy", label, split, marco, x0, y0, x1, y1, fps, nombre_base_clip])
+        escritor.writerow([f"{base}.npy", split, marco, x0, y0, x1, y1, fps, nombre_base_clip])
         anot.flush()
         os.fsync(anot.fileno())
         n_ok += 1
-        print(f"  [ok]   {nombre_base_clip} -> {base}.npy  label={label}  split={split}  marco={marco}  ventana={ventana}  tubo={arr.shape}")
+        print(f"  [ok]   {nombre_base_clip} -> {base}.npy  split={split}  marco={marco}  ventana={ventana}  tubo={arr.shape}")
 
     anot.close()
     print(f"\n{n_ok} tubos generados, {n_skip} saltados, {n_saltados_ya} ya estaban de una corrida "
