@@ -95,6 +95,12 @@ def main():
     ap.add_argument("carpeta_videos")
     ap.add_argument("out_dir")
     ap.add_argument("--pose-model", default="yolo11m-pose.pt")
+    ap.add_argument("--guardar-videos", action="store_true",
+                     help="ademas del .npy, guarda un .mp4 por tubo para inspeccion visual "
+                          "(paso extra de I/O -- para el dataset real se deja apagado, esto "
+                          "es solo para QA sobre una muestra chica)")
+    ap.add_argument("--val-frac", type=float, default=0.15,
+                     help="fraccion de clips que se van a split=val (aleatorio, ver aviso abajo)")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -103,8 +109,14 @@ def main():
     clips = sorted(glob.glob(os.path.join(args.carpeta_videos, "*.mp4")))
     print(f"{len(clips)} clips en {args.carpeta_videos}")
 
-    man = open(os.path.join(args.out_dir, "manifest.csv"), "w")
-    man.write("npy,clase_ALEATORIA,marco,ventana,clip\n")
+    # anotaciones.csv: UNA sola tabla (npy, clase, split, marco, ventana,
+    # clip_origen) -- reemplaza el manifest.csv de antes. "clase" sigue
+    # ALEATORIA (no hay labeling real todavia, ver docstring del modulo);
+    # "split" tambien es un sorteo simple por ahora -- para el dataset real
+    # conviene separar por clip/dia/camara de origen, no al azar por tubo,
+    # para no filtrar frames del mismo evento entre train y val.
+    anot = open(os.path.join(args.out_dir, "anotaciones.csv"), "w")
+    anot.write("npy,clase_ALEATORIA,split_ALEATORIO,marco,ventana,clip_origen\n")
 
     n_ok = n_skip = 0
     for clip in clips:
@@ -119,28 +131,30 @@ def main():
             print(f"  [skip] {os.path.basename(clip)} -- sin keypoints validos")
             continue
 
-        clase = random.choice(["hurto", "normal"])   # ALEATORIO, solo para probar la mecanica
+        clase = random.choice(["hurto", "normal"])          # ALEATORIO, solo para probar la mecanica
+        split = "val" if random.random() < args.val_frac else "train"   # ALEATORIO, ver aviso arriba
         nombre_clip = os.path.splitext(os.path.basename(clip))[0]
         base = f"{clase}__{nombre_clip}"
-        arr = tubo.permute(0, 2, 3, 1).cpu().numpy()   # T,C,H,W -> T,H,W,C, para que quede igual formato que el dataset viejo
+        arr = tubo.permute(0, 2, 3, 1).cpu().numpy()   # T,C,H,W -> T,H,W,C, mismo formato que el dataset viejo
         np.save(os.path.join(args.out_dir, base + ".npy"), arr)
 
-        # video de la zona de recorte, para validar visualmente que el tubo
-        # de verdad sigue a la persona -- mismo criterio (4fps) que los
-        # clips de alerta del resto del repo (guarda_alerta en main.py /
-        # los notebooks): 16 frames a 4fps = los ~4s de la ventana original.
-        video_path = os.path.join(args.out_dir, base + ".mp4")
-        h, w = arr.shape[1], arr.shape[2]
-        vw = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*"mp4v"), 4, (w, h))
-        for fr in arr:
-            vw.write(fr[:, :, ::-1])   # RGB -> BGR para escribir
-        vw.release()
-        man.write(f"{base}.npy,{clase},{marco},{ventana},{os.path.basename(clip)}\n")
-        n_ok += 1
-        print(f"  [ok]   {os.path.basename(clip)} -> {base}.npy (+.mp4)  marco={marco}  ventana={ventana}  tubo={arr.shape}")
+        if args.guardar_videos:
+            # video de la zona de recorte, SOLO para inspeccion visual -- no
+            # es parte de los datos de entrenamiento en si. Mismo criterio
+            # (4fps) que guarda_alerta en el resto del repo.
+            video_path = os.path.join(args.out_dir, base + ".mp4")
+            h, w = arr.shape[1], arr.shape[2]
+            vw = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*"mp4v"), 4, (w, h))
+            for fr in arr:
+                vw.write(fr[:, :, ::-1])   # RGB -> BGR para escribir
+            vw.release()
 
-    man.close()
-    print(f"\n{n_ok} tubos generados, {n_skip} saltados -> {args.out_dir}")
+        anot.write(f"{base}.npy,{clase},{split},{marco},{ventana},{os.path.basename(clip)}\n")
+        n_ok += 1
+        print(f"  [ok]   {os.path.basename(clip)} -> {base}.npy  marco={marco}  split={split}  ventana={ventana}  tubo={arr.shape}")
+
+    anot.close()
+    print(f"\n{n_ok} tubos generados, {n_skip} saltados -> {args.out_dir}/anotaciones.csv")
 
 
 if __name__ == "__main__":
