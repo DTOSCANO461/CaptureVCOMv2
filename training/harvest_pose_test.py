@@ -40,6 +40,8 @@ Uso:
 <carpeta_videos> debe ser una carpeta cuyo nombre sea un dataset_tipo
 conocido (labeling_strategy.FPS_POR_CARPETA) -- ej. ".../videos_for_train/control_negativo".
 """
+import csv
+import errno
 import os
 import sys
 import glob
@@ -57,6 +59,28 @@ from ultralytics import YOLO
 
 DEVICE = "cuda"
 PROB_VIDEO_QA = 0.01   # ~1% de los tubos, ademas de --guardar-videos (que fuerza el 100%)
+
+
+def guarda_npy_atomico(path, arr):
+    """np.save directo puede dejar un .npy TRUNCADO/corrupto si el disco se
+    llena a mitad de la escritura (justo el escenario que puede pasar en una
+    cosecha larga). Se escribe a un .tmp en el mismo directorio y se hace
+    rename -- en Linux el rename es atomico, asi que nunca queda un .npy a
+    medio escribir con el nombre final: o esta completo, o no existe."""
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:   # file handle, no un path -- si no, np.save AGREGA ".npy" solo
+        np.save(f, arr)
+    os.replace(tmp, path)
+
+
+def clips_ya_procesados(anotaciones_path):
+    """Lee anotaciones.csv si ya existe (de una corrida anterior interrumpida)
+    y devuelve el set de clip_origen ya escritos -- para poder retomar sin
+    reprocesar. Si el archivo no existe todavia, set vacio."""
+    if not os.path.exists(anotaciones_path):
+        return set()
+    with open(anotaciones_path) as f:
+        return {r["clip_origen"] for r in csv.DictReader(f)}
 
 
 def frame_a_gpu(frame_bgr):
@@ -137,12 +161,28 @@ def main():
     # por clip/dia/camara de origen, no al azar por tubo, para no filtrar el
     # mismo evento entre train y val.
     print("AVISO: split en anotaciones.csv es un sorteo -- todavia no se separa por dia/camara de origen")
-    anot = open(os.path.join(args.out_dir, "anotaciones.csv"), "w")
-    anot.write("npy,label,split,marco,ventana,fps,clip_origen\n")
 
-    n_ok = n_skip = 0
+    anot_path = os.path.join(args.out_dir, "anotaciones.csv")
+    ya_procesados = clips_ya_procesados(anot_path)   # RETOMAR: de una corrida anterior interrumpida (ej. disco lleno)
+    if ya_procesados:
+        print(f"RETOMANDO: {len(ya_procesados)} clips ya estan en {anot_path}, se saltan")
+    anot = open(anot_path, "a" if ya_procesados or os.path.exists(anot_path) else "w", newline="")
+    # csv.writer, no f-strings: "ventana" son 4 numeros con comas -- escrito a
+    # mano (sin comillas) esas comas se confunden con separadores de columna
+    # y corren todo lo que viene despues (fps, clip_origen). Se parte ademas
+    # en 4 columnas (x0,y0,x1,y1) en vez de una tupla-string.
+    escritor = csv.writer(anot)
+    if not ya_procesados and anot.tell() == 0:
+        escritor.writerow(["npy", "label", "split", "marco", "x0", "y0", "x1", "y1", "fps", "clip_origen"])
+        anot.flush()
+
+    n_ok = n_skip = n_saltados_ya = 0
     for clip in clips:
-        nombre_clip = os.path.splitext(os.path.basename(clip))[0]
+        nombre_base_clip = os.path.basename(clip)
+        if nombre_base_clip in ya_procesados:
+            n_saltados_ya += 1
+            continue
+        nombre_clip = os.path.splitext(nombre_base_clip)[0]
         marco = round(random.uniform(pp.MARCO_MIN_TRAIN, pp.MARCO_MAX_TRAIN), 3)
 
         try:
@@ -169,26 +209,44 @@ def main():
         split = "val" if random.random() < args.val_frac else "train"   # ALEATORIO, ver aviso arriba
         base = f"L{label:02d}__{nombre_clip}"
         arr = tubo.permute(0, 2, 3, 1).cpu().numpy()   # T,C,H,W -> T,H,W,C, mismo formato que el dataset viejo
-        np.save(os.path.join(args.out_dir, base + ".npy"), arr)
 
-        if args.guardar_videos or random.random() < PROB_VIDEO_QA:
-            # video de la zona de recorte, SOLO para inspeccion visual -- no
-            # es parte de los datos de entrenamiento en si. Mismo criterio
-            # (4fps) que guarda_alerta en el resto del repo.
-            video_path = os.path.join(args.out_dir, base + ".mp4")
-            h, w = arr.shape[1], arr.shape[2]
-            vw = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*"mp4v"), 4, (w, h))
-            for fr in arr:
-                vw.write(fr[:, :, ::-1])   # RGB -> BGR para escribir
-            vw.release()
-            print(f"         (QA) video guardado: {base}.mp4")
+        try:
+            guarda_npy_atomico(os.path.join(args.out_dir, base + ".npy"), arr)
 
-        anot.write(f"{base}.npy,{label},{split},{marco},{ventana},{fps},{os.path.basename(clip)}\n")
+            if args.guardar_videos or random.random() < PROB_VIDEO_QA:
+                # video de la zona de recorte, SOLO para inspeccion visual --
+                # no es parte de los datos de entrenamiento en si. Mismo
+                # criterio (4fps) que guarda_alerta en el resto del repo.
+                video_path = os.path.join(args.out_dir, base + ".mp4")
+                h, w = arr.shape[1], arr.shape[2]
+                vw = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*"mp4v"), 4, (w, h))
+                for fr in arr:
+                    vw.write(fr[:, :, ::-1])   # RGB -> BGR para escribir
+                vw.release()
+                print(f"         (QA) video guardado: {base}.mp4")
+        except OSError as e:
+            if e.errno == errno.ENOSPC:
+                anot.close()
+                print(f"\nDISCO LLENO al escribir {base}.npy -- {n_ok} tubos ya quedaron guardados "
+                      f"y confirmados en {anot_path} (ninguno queda a medio escribir, el .npy se "
+                      f"escribe atomico). Libera espacio y corre EXACTAMENTE el mismo comando de "
+                      f"nuevo -- retoma solo, salta los {n_ok} que ya estan en anotaciones.csv.")
+                sys.exit(1)
+            raise
+
+        # flush + fsync: la fila queda en disco YA, no solo en el buffer de
+        # Python/OS -- si el proceso muere (disco lleno, kill -9, corte de luz)
+        # en el clip siguiente, esta fila no se pierde y el retomado no la repite.
+        x0, y0, x1, y1 = ventana
+        escritor.writerow([f"{base}.npy", label, split, marco, x0, y0, x1, y1, fps, nombre_base_clip])
+        anot.flush()
+        os.fsync(anot.fileno())
         n_ok += 1
-        print(f"  [ok]   {os.path.basename(clip)} -> {base}.npy  label={label}  split={split}  marco={marco}  ventana={ventana}  tubo={arr.shape}")
+        print(f"  [ok]   {nombre_base_clip} -> {base}.npy  label={label}  split={split}  marco={marco}  ventana={ventana}  tubo={arr.shape}")
 
     anot.close()
-    print(f"\n{n_ok} tubos generados, {n_skip} saltados -> {args.out_dir}/anotaciones.csv")
+    print(f"\n{n_ok} tubos generados, {n_skip} saltados, {n_saltados_ya} ya estaban de una corrida "
+          f"anterior -> {args.out_dir}/anotaciones.csv")
 
 
 if __name__ == "__main__":
