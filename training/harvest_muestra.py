@@ -44,7 +44,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("videos_for_train_dir")
     ap.add_argument("out_dir")
-    ap.add_argument("--n", type=int, default=500)
+    ap.add_argument("--n", type=int, default=500,
+                     help="TOTAL de tubos que debe tener anotaciones.csv al terminar -- si ya hay "
+                          "N_previos de una corrida anterior en out_dir, se sortean solo los que faltan "
+                          "(N - N_previos) de clips NUEVOS, sin reprocesar ni volver a sortear los que ya estan")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--pose-model", default="yolo11m-pose.pt")
     ap.add_argument("--guardar-videos", action="store_true")
@@ -58,24 +61,28 @@ def main():
     print(f"carpetas incluidas en el sorteo ({len(carpetas)}): {carpetas}")
     print(f"carpetas EXCLUIDAS (sin reglas de labeling todavia): {sorted(CARPETAS_EXCLUIDAS)}")
 
+    anot_path = os.path.join(args.out_dir, "anotaciones.csv")
+    ya_procesados = clips_ya_procesados_multi(anot_path)   # (dataset_tipo, clip_origen) de una corrida anterior -- AJUSTA EL POOL DE SORTEO, no solo el skip
+    if ya_procesados:
+        print(f"{len(ya_procesados)} tubos ya estan en {anot_path} -- se reusan, no se reprocesan")
+
     pool = []
     for carpeta in carpetas:
         fps = ls.fps_de_carpeta(carpeta)  # se detiene aca si a alguna le falta el fps -- antes de sortear nada
         clips = glob.glob(os.path.join(args.videos_for_train_dir, carpeta, "*.mp4"))
-        pool += [(c, carpeta, fps) for c in clips]
-    print(f"pool total: {len(pool)} clips en {len(carpetas)} carpetas")
+        pool += [(c, carpeta, fps) for c in clips if (carpeta, os.path.basename(c)) not in ya_procesados]
+    print(f"pool disponible (ya excluidos los {len(ya_procesados)} ya hechos): {len(pool)} clips en {len(carpetas)} carpetas")
+
+    n_faltantes = max(0, args.n - len(ya_procesados))
+    print(f"objetivo: {args.n} tubos en total -> faltan {n_faltantes} NUEVOS por sortear/procesar")
 
     random.seed(args.seed)
-    muestra = random.sample(pool, min(args.n, len(pool)))
-    print(f"muestra sorteada: {len(muestra)} clips (seed={args.seed})")
+    muestra = random.sample(pool, min(n_faltantes, len(pool)))
+    print(f"muestra sorteada: {len(muestra)} clips nuevos (seed={args.seed})")
 
     os.makedirs(args.out_dir, exist_ok=True)
     modelo_pose = YOLO(args.pose_model)
 
-    anot_path = os.path.join(args.out_dir, "anotaciones.csv")
-    ya_procesados = clips_ya_procesados_multi(anot_path)
-    if ya_procesados:
-        print(f"RETOMANDO: {len(ya_procesados)} clips ya estan en {anot_path}, se saltan")
     anot = open(anot_path, "a" if ya_procesados or os.path.exists(anot_path) else "w", newline="")
     escritor = csv.writer(anot)
     if not ya_procesados and anot.tell() == 0:
