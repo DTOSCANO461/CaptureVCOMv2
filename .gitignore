@@ -20,6 +20,8 @@ data/
 ENTRENAMIENTO/pesos/
 ENTRENAMIENTO/tubes_anon.tar
 ENTRENAMIENTO/tubes/
+videos_for_train/
+*.zip
 
 # Python
 __pycache__/
