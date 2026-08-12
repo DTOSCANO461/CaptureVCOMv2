@@ -42,6 +42,7 @@ conocido (labeling_strategy.FPS_POR_CARPETA) -- ej. ".../videos_for_train/contro
 """
 import csv
 import errno
+import hashlib
 import os
 import sys
 import glob
@@ -59,6 +60,19 @@ from ultralytics import YOLO
 
 DEVICE = "cuda"
 PROB_VIDEO_QA = 0.01   # ~1% de los tubos, ademas de --guardar-videos (que fuerza el 100%)
+MAX_LARGO_NOMBRE = 150   # algunos clips fuente tienen nombres absurdamente largos --
+                         # visto en vivo: uno rompio el limite de 255 bytes del filesystem
+                         # al construir "L<label>__<carpeta>__<nombre>.npy.tmp"
+
+
+def nombre_seguro(base, max_len=MAX_LARGO_NOMBRE):
+    """Trunca `base` si excede max_len caracteres, agregando un hash corto
+    del nombre COMPLETO original para no perder unicidad entre dos nombres
+    que truncados quedarian identicos."""
+    if len(base) <= max_len:
+        return base
+    h = hashlib.sha1(base.encode()).hexdigest()[:8]
+    return base[:max_len] + "__" + h
 
 
 def guarda_npy_atomico(path, arr):
@@ -101,22 +115,36 @@ def keypoints_por_frame_max_confianza(modelo_pose, frame_bgr):
     return res.keypoints.xy.cpu().numpy()[idx_mejor]   # (17,2)
 
 
+FPS_OBJETIVO = 25 / 3   # ~8.33 -- "acercar todo a 8fps" pedido explicitamente
+
+
 def extrae_tubo(modelo_pose, clip, marco, fps):
     cap = cv2.VideoCapture(clip)
     w, h = int(cap.get(3)), int(cap.get(4))
-    frames = []
+    frames_todos = []
     while True:
         ok, fr = cap.read()
         if not ok:
             break
-        frames.append(fr)
+        frames_todos.append(fr)
     cap.release()
-    if not frames:
+    if not frames_todos:
         return None, None, None
+
+    # Acercar todo a ~8fps: las carpetas a 25fps corren pose sobre ~3x mas
+    # frames por ventana que las de 8fps para la MISMA duracion (+-2s) --
+    # 3x mas lento sin ganar nada (la ventana temporal sigue siendo ~4s de
+    # video real). Subsamplear a 1 de cada `stride` frames antes de armar la
+    # ventana homogeniza la densidad temporal entre carpetas Y achica el
+    # costo de pose proporcionalmente. Con fps=25 -> stride=3 (~8.33fps,
+    # exactamente lo pedido); con fps=8/9 -> stride=1 (no cambia nada).
+    stride = max(1, round(fps / FPS_OBJETIVO))
+    frames = frames_todos[::stride]
+    fps_efectivo = fps / stride
 
     n = len(frames)
     center = n // 2
-    radio = fps * 2   # +-2s = ~4s, el WINDOW_S del modelo -- fps REAL de la carpeta, no fijo
+    radio = fps_efectivo * 2   # +-2s = ~4s, el WINDOW_S del modelo -- sobre el fps YA acercado a 8, no el original
     idx_ventana = [i for i in range(n) if abs(i - center) <= radio]
     if len(idx_ventana) < 4:
         idx_ventana = list(range(n))   # mismo fallback que harvest_v14.py: si la ventana quedo muy chica, usar todo el clip
@@ -128,7 +156,7 @@ def extrae_tubo(modelo_pose, clip, marco, fps):
 
     frames_gpu = [frame_a_gpu(frames[i]) for i in idx_ventana]
     tubo_store = pp.recorta_y_redimensiona_gpu(frames_gpu, ventana, out_size=pp.STORE_SIZE)
-    return tubo_store, ventana, n
+    return tubo_store, ventana, len(frames_todos)
 
 
 def main():
@@ -207,7 +235,7 @@ def main():
         label = results["label"]
 
         split = "val" if random.random() < args.val_frac else "train"   # ALEATORIO, ver aviso arriba
-        base = f"L{label:02d}__{nombre_clip}"
+        base = nombre_seguro(f"L{label:02d}__{nombre_clip}")
         arr = tubo.permute(0, 2, 3, 1).cpu().numpy()   # T,C,H,W -> T,H,W,C, mismo formato que el dataset viejo
 
         try:

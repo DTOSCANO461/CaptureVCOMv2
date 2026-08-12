@@ -121,7 +121,7 @@ def main():
         label = results["label"]
 
         split = "val" if random.random() < args.val_frac else "train"
-        base = f"L{label:02d}__{dataset_tipo}__{nombre_clip}"
+        base = hpt.nombre_seguro(f"L{label:02d}__{dataset_tipo}__{nombre_clip}")
         arr = tubo.permute(0, 2, 3, 1).cpu().numpy()
 
         try:
