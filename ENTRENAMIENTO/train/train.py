@@ -91,31 +91,45 @@ class TubeDataset(Dataset):
             arr = arr[idx]
         arr = arr.copy()
 
-        if self.zoom < 1.0:
-            # recorte central: menos fondo de tienda, más persona
-            z = self.zoom * (random.uniform(0.92, 1.08) if self.train else 1.0)
-            z = float(np.clip(z, 0.35, 1.0))
-            side = int(round(arr.shape[1] * z))
-            o = (arr.shape[1] - side) // 2
-            arr = np.ascontiguousarray(arr[:, o:o+side, o:o+side])
-
+        # Recorte espacial: ANTES eran dos recortes anidados (zoom jitter ±8%
+        # sobre self.zoom, y despues un segundo crop aleatorio 78-100% de ESE
+        # resultado) resueltos con un unico resize final a 224. Un solo resize
+        # de verdad necesita un solo recorte: se sortea UNA ventana (tamano +
+        # posicion) por muestra, con un rango de tamano que cubre aprox. el
+        # mismo intervalo que el viejo par anidado (zoom*[0.78,1.08], en vez
+        # de zoom*[0.92,1.08] seguido de otro *[0.78,1.0]) y un jitter de
+        # posicion (~11% del lado) equivalente al desplazamiento maximo que el
+        # crop anidado viejo permitia. No es una reproduccion estadistica
+        # exacta del esquema anterior -- ese era justamente el problema, dos
+        # aleatoriedades encadenadas son dificiles de razonar -- pero cubre un
+        # rango de aumento comparable con una sola operacion, auditable.
+        L0 = arr.shape[1]
         if self.train:
+            z = float(np.clip(self.zoom * random.uniform(0.78, 1.08), 0.35, 1.0))
+            side = int(round(L0 * z))
+            max_off = int(round(0.11 * side))
+            cy = L0 // 2 + (random.randint(-max_off, max_off) if max_off else 0)
+            cx = L0 // 2 + (random.randint(-max_off, max_off) if max_off else 0)
+            y0 = int(np.clip(cy - side // 2, 0, L0 - side))
+            x0 = int(np.clip(cx - side // 2, 0, L0 - side))
+            arr = np.ascontiguousarray(arr[:, y0:y0+side, x0:x0+side])
+
             if random.random() < 0.5:
                 arr = self._fake_circle(arr)
             if random.random() < 0.30:
                 arr = self._fake_blur(arr)
-            # crop espacial aleatorio (relativo al lado actual, que depende de zoom)
-            L = arr.shape[1]
-            s = random.randint(int(L * 0.78), L)
-            y0 = random.randint(0, L - s)
-            x0 = random.randint(0, L - s)
-            arr = arr[:, y0:y0+s, x0:x0+s]
             if random.random() < 0.5:
                 arr = arr[:, :, ::-1]  # flip H
-        else:
-            L = arr.shape[1]
-            m = int(L * 0.0625)          # margen equivalente a 16/256
-            arr = arr[:, m:L-m, m:L-m]   # center crop
+        elif self.zoom < 1.0:
+            # equivalente EXACTO (mismos enteros, sin azar) al viejo par de
+            # recortes centrados en eval: zoom centrado + margen 6.25% del
+            # resultado colapsados en un solo recorte centrado.
+            side1 = int(round(L0 * self.zoom))
+            o1 = (L0 - side1) // 2
+            m = int(side1 * 0.0625)
+            side = side1 - 2 * m
+            off = o1 + m
+            arr = np.ascontiguousarray(arr[:, off:off+side, off:off+side])
 
         x = torch.from_numpy(np.ascontiguousarray(arr)).float() / 255.0  # T,H,W,C
         x = x.permute(3, 0, 1, 2)  # C,T,H,W
