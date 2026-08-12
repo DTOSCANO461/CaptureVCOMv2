@@ -33,29 +33,36 @@ import torch.nn.functional as F
 
 N_FRAMES = 16                  # VideoMAE (el ejemplo de referencia usa 32, para PoseC3D)
 NUM_KEYPOINTS = 17             # COCO-17, salida de yolo*-pose
-PADDING = 0.5                  # margen proporcional sobre el bbox de keypoints. Calibrado
-                                # contra videos/paco_robo1/sr_stream_1.ts para dar un lado de
-                                # recorte parecido al metodo viejo (deteccion, mediana*1.9):
-                                # con padding=0.5 salio ratio 0.96 (ver registro de calibracion
-                                # en el historial de cambios). Ajustable, es una sola constante.
-HW_RATIO = 1.0                 # fuerza ventana CUADRADA (se usa el lado mayor de los dos)
+PADDING = 0.5                  # margen proporcional sobre el bbox TIGHT de keypoints (side =
+                                # lado_mayor_del_esqueleto * (1+padding)). PLACEHOLDER: pendiente
+                                # de que se defina el valor real -- no calibrado contra nada, ver
+                                # bbox_desde_keypoints() para la formula exacta.
 OUT_SIZE = 224                 # resolucion de entrada de VideoMAE
 STORE_SIZE = 256               # tamano al que se guardan los tubos de ENTRENAMIENTO:
                                 # 224 + 32 de holgura -> el offset de la ventana (Paso de
                                 # augmentation) desliza en [0,32] en cada eje, sin resize extra.
 
 
-def bbox_desde_keypoints(kp_clip, frame_w, frame_h, padding=PADDING, hw_ratio=HW_RATIO):
+def bbox_desde_keypoints(kp_clip, frame_w, frame_h, padding=PADDING):
     """kp_clip: (T,17,2) en pixeles nativos, (0,0) donde el keypoint no es valido
     (mismo criterio que el motor YOLO-pose / ejemplo_poses.py: x<=0.01 o y<=0.01
     se tratan como invalidos).
 
-    Igual que PoseCompact: bbox ajustado a TODOS los keypoints validos del
-    clip completo (no por frame), con padding proporcional, forzado a
-    cuadrado (hw_ratio=1.0) y clampeado a los bordes del frame.
+    bbox TIGHT ajustado a TODOS los keypoints validos del clip completo (no
+    por frame): de mano a mano, de cabeza a pies visibles -- sin margen
+    todavia. `padding` multiplica el lado mayor de ese bbox por (1+padding)
+    para dar el lado final del recorte (ventana SIEMPRE cuadrada: el chico
+    de VideoMAE necesita 224x224, no un rectangulo).
 
-    Devuelve (x0,y0,x1,y1) enteros, o None si no hubo ningun keypoint valido
-    en todo el clip.
+    Garantiza devolver una ventana de exactamente `side x side` (side =
+    round(lado*(1+padding)), clampado a min(frame_w,frame_h) si hiciera
+    falta): en vez de centrar y despues recortar cada borde contra el frame
+    por separado (eso rompe la simetria y puede achicar el lado cerca de un
+    borde), primero se fija el tamano y LUEGO se desliza la posicion para
+    que quepa entera -- mismo criterio que camara_worker.make_tube.
+
+    Devuelve (x0,y0,x1,y1) enteros con x1-x0 == y1-y0 siempre, o None si no
+    hubo ningun keypoint valido en todo el clip.
     """
     kp_x, kp_y = kp_clip[..., 0], kp_clip[..., 1]
     validos = (kp_x > 0.01) & (kp_y > 0.01)
@@ -64,22 +71,18 @@ def bbox_desde_keypoints(kp_clip, frame_w, frame_h, padding=PADDING, hw_ratio=HW
 
     min_x, max_x = float(kp_x[validos].min()), float(kp_x[validos].max())
     min_y, max_y = float(kp_y[validos].min()), float(kp_y[validos].max())
-
     cx, cy = (min_x + max_x) / 2, (min_y + max_y) / 2
-    half_w = (max_x - min_x) / 2 * (1 + padding)
-    half_h = (max_y - min_y) / 2 * (1 + padding)
 
-    half_h = max(hw_ratio * half_w, half_h)
-    half_w = max((1 / hw_ratio) * half_h, half_w)
-
-    x0, x1 = cx - half_w, cx + half_w
-    y0, y1 = cy - half_h, cy + half_h
-
-    x0, y0 = int(max(0, x0)), int(max(0, y0))
-    x1, y1 = int(min(frame_w, x1)), int(min(frame_h, y1))
-    if x1 <= x0 or y1 <= y0:
+    lado_mayor = max(max_x - min_x, max_y - min_y)
+    side = lado_mayor * (1 + padding)
+    side = min(side, min(frame_w, frame_h))    # nunca mas grande que el frame -> el deslizamiento de abajo siempre alcanza
+    side_i = int(round(side))
+    if side_i <= 0:
         return None
-    return x0, y0, x1, y1
+
+    x0 = int(np.clip(cx - side / 2, 0, frame_w - side_i))
+    y0 = int(np.clip(cy - side / 2, 0, frame_h - side_i))
+    return x0, y0, x0 + side_i, y0 + side_i
 
 
 def recorta_y_redimensiona_gpu(frames_gpu, ventana, out_size, n_frames=N_FRAMES):
@@ -105,20 +108,35 @@ def recorta_y_redimensiona_gpu(frames_gpu, ventana, out_size, n_frames=N_FRAMES)
 
 
 def ventanea(tubo_store, out_size=OUT_SIZE, offset=None):
-    """tubo_store: (T,3,STORE_SIZE,STORE_SIZE) uint8 en GPU (ya generado con
-    recorta_y_redimensiona_gpu(out_size=STORE_SIZE)).
+    """tubo_store: (T,3,H,W) uint8 en GPU (ya generado con
+    recorta_y_redimensiona_gpu, en teoria siempre H==W==STORE_SIZE porque
+    bbox_desde_keypoints garantiza una ventana cuadrada -- pero esto no
+    ASUME esa garantia: si H y/o W llegan mas chicos que out_size (H!=W
+    incluido), primero se extiende el borde opuesto (replicate, sin
+    reescalar nada) hasta alcanzar out_size en cada eje, y recien ahi se
+    desliza. Nunca falla por tubo chico, nunca hace un segundo resize.
 
     Data augmentation de POSICION: slice puro, sin resize.
     offset=None  -> sortea uno aleatorio en [0,holgura] por eje (entrenamiento).
     offset=(oy,ox) -> ventana fija (eval/inferencia: holgura//2 = centrado).
     """
-    store_size = tubo_store.shape[-1]
-    holgura = store_size - out_size
+    _, _, H, W = tubo_store.shape
+    falta_h, falta_w = max(0, out_size - H), max(0, out_size - W)
+    if falta_h or falta_w:
+        # F.pad opera sobre las 2 ultimas dims: (izq,der,arriba,abajo).
+        # Todo el faltante se agrega del lado derecho/abajo -- "ampliar el
+        # borde opuesto" en vez de perder resolucion o volver a resize.
+        tubo_store = F.pad(tubo_store.float(), (0, falta_w, 0, falta_h),
+                            mode="replicate").to(tubo_store.dtype)
+        H, W = tubo_store.shape[-2:]
+
+    holgura_h, holgura_w = H - out_size, W - out_size
     if offset is None:
-        oy = int(torch.randint(0, holgura + 1, (1,)).item()) if holgura > 0 else 0
-        ox = int(torch.randint(0, holgura + 1, (1,)).item()) if holgura > 0 else 0
+        oy = int(torch.randint(0, holgura_h + 1, (1,)).item()) if holgura_h > 0 else 0
+        ox = int(torch.randint(0, holgura_w + 1, (1,)).item()) if holgura_w > 0 else 0
     else:
         oy, ox = offset
+        oy, ox = min(oy, holgura_h), min(ox, holgura_w)   # por si el offset centrado se calculo contra STORE_SIZE nominal
     return tubo_store[:, :, oy:oy + out_size, ox:ox + out_size]
 
 
