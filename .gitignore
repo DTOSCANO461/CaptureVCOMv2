@@ -31,3 +31,4 @@ venv/
 
 # Config local de Claude Code (especifica de cada maquina)
 .claude/settings.local.json
+.claude/scheduled_tasks.lock
