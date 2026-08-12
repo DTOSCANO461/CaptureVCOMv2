@@ -1,0 +1,16 @@
+[Unit]
+Description=CaptureVCOMv2 - deteccion de hurtos v5 (piloto, sustituye a CAPTURE)
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/capturevcomv2
+Environment=PYTHONUNBUFFERED=1
+Environment=CVC_THR=0.1
+ExecStart=/opt/capturevcomv2/venv/bin/python /opt/capturevcomv2/main.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

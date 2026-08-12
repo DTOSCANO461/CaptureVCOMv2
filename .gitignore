@@ -1,0 +1,31 @@
+# Secretos y config por tienda (usar config.example.py / vlm.env.example)
+config.py
+vlm.env
+
+# Modelos (pesos van por GCS/release, no por git)
+model/
+*.pt
+
+# Datos y salidas
+data/
+*.mp4
+*.npy
+*.log
+*.ts
+*.idx2
+.fuse_hidden*
+.~lock.*#
+
+# Dataset de entrenamiento (grande, va por tar/GCS aparte, no por git)
+ENTRENAMIENTO/pesos/
+ENTRENAMIENTO/tubes_anon.tar
+ENTRENAMIENTO/tubes/
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Config local de Claude Code (especifica de cada maquina)
+.claude/settings.local.json

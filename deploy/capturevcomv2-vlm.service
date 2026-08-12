@@ -1,0 +1,17 @@
+[Unit]
+Description=CaptureVCOMv2 VLM - segunda opinion y envio a pc-agent
+After=network-online.target capturevcomv2.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/capturevcomv2
+# vlm.env contiene PC_API_KEY y CENTRAL_SERVER_URL (ver deploy/vlm.env.example)
+EnvironmentFile=/opt/capturevcomv2/vlm.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/capturevcomv2/venv/bin/python /opt/capturevcomv2/verificador_vlm.py
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

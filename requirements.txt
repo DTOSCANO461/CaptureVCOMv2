@@ -1,0 +1,8 @@
+numpy==2.4.4
+qtfaststart==1.8
+pillow==12.2.0
+requests==2.34.2
+torch==2.13.0+cu130
+torchvision==0.28.0+cu130
+transformers==5.14.1
+ultralytics==8.4.110

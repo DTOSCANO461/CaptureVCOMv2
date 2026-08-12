@@ -1,0 +1,17 @@
+[Unit]
+Description=CaptureVCOMv2 envio directo a la app (sin VLM)
+After=network-online.target capturevcomv2.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/capturevcomv2
+EnvironmentFile=-/opt/capturevcomv2/vlm.env
+Environment=PYTHONUNBUFFERED=1
+Environment=APP_THR=0.85
+ExecStart=/opt/capturevcomv2/venv/bin/python /opt/capturevcomv2/envia_directo.py
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
