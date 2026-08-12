@@ -22,6 +22,15 @@ from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 ROOT = "/home/tomis/SBT/DATASETS"
 RUNS = os.path.join(ROOT, "train", "runs")
 
+# Multiclase: hasta 70 acciones (0-69; 69 es DEFAULT_ACCION en
+# labeling_strategy.py, el placeholder de "no se pudo resolver un label
+# real"). Antes esto era binario (2 = hurto/normal) -- build_model() y
+# TubeDataset todavia asumen ese binario en otros puntos (WeightedRandomSampler
+# balanceado por "clase" hurto/normal, evaluate() con AUC/AP de 1 sola
+# columna): falta actualizar esos para multiclase de verdad, esto solo
+# cambia el tamano de la cabeza.
+NUM_CLASES = 70
+
 
 # ────────────────────────── datos ──────────────────────────
 
@@ -163,7 +172,7 @@ def build_model(name):
                     "MCG-NJU/videomae-base-finetuned-kinetics"]:
             try:
                 m = VideoMAEForVideoClassification.from_pretrained(
-                    mid, num_labels=2, ignore_mismatched_sizes=True)
+                    mid, num_labels=NUM_CLASES, ignore_mismatched_sizes=True)
                 print(f"[modelo] {mid}")
                 mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
                 # HF espera (B,T,C,H,W)
@@ -182,7 +191,7 @@ def build_model(name):
     elif name == "mvit":
         from torchvision.models.video import mvit_v2_s, MViT_V2_S_Weights
         m = mvit_v2_s(weights=MViT_V2_S_Weights.KINETICS400_V1)
-        m.head[1] = nn.Linear(m.head[1].in_features, 2)
+        m.head[1] = nn.Linear(m.head[1].in_features, NUM_CLASES)
         return m, [0.45, 0.45, 0.45], [0.225, 0.225, 0.225]
     raise ValueError(name)
 
