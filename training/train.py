@@ -26,35 +26,60 @@ RUNS = os.path.join(ROOT, "train", "runs")
 # ────────────────────────── datos ──────────────────────────
 
 def load_index():
-    labels = {r["path"]: r for r in csv.DictReader(open(f"{ROOT}/audit/labels.csv"))}
-    tubes = list(csv.DictReader(open(f"{ROOT}/audit/tubes_meta.csv")))
+    """Lee ROOT/anotaciones.csv -- UNA sola tabla (npy,clase,split,...), la que
+    genera training/harvest_pose_test.py (o su version real una vez que haya
+    labels de verdad, mismo esquema). Reemplaza el join labels.csv/tubes_meta.csv
+    del dataset viejo -- ya no aplica, el dataset nuevo no se genera asi."""
+    rows = list(csv.DictReader(open(f"{ROOT}/anotaciones.csv")))
     items = []
-    for t in tubes:
-        if not t["npy"]:
+    for r in rows:
+        if not r.get("npy"):
             continue
-        r = labels.get(t["path"])
-        if not r:
-            continue
-        items.append({
-            "npy": os.path.join(ROOT, "tubes", t["npy"]),
-            "clase": r["clase"], "split": r["split"], "dataset": r["dataset"],
-            "flag": t["flag"], "score_prod": r.get("score_prod", ""),
-        })
+        items.append({"npy": os.path.join(ROOT, "tubes", r["npy"]), "clase": r["clase"], "split": r["split"]})
     return items
 
 
-class TubeDataset(Dataset):
-    """zoom: fracción central del tubo que se conserva. El tubo cubre 1.9x la caja
-    de la persona, así que zoom<1 recorta fondo de tienda y obliga al modelo a
-    fijarse en la persona y no en el escenario (evita el atajo showroom/súper)."""
+def _ventanea_np(arr, out_size, offset=None):
+    """arr: (T,H,W,C) uint8. Slice puro (sin resize) de out_size x out_size.
+    Mismo criterio que pose_pipeline.ventanea (CaptureVCOMv2/pose_pipeline.py) --
+    reimplementado aca en numpy puro (sin importar pose_pipeline, sin torch)
+    para que este archivo se mantenga AUTONOMO: solo necesita el .npy y las
+    anotaciones, nada mas del repo (ver ENTRENAMIENTO/LEEME.md).
+    offset=None -> sortea uno aleatorio en [0,holgura] por eje (entrenamiento).
+    offset=(oy,ox) -> ventana fija (eval: offset_centrado() mas abajo).
+    """
+    H, W = arr.shape[1], arr.shape[2]
+    assert H >= out_size and W >= out_size, f"tubo ({H}x{W}) mas chico que out_size={out_size}"
+    holgura_h, holgura_w = H - out_size, W - out_size
+    if offset is None:
+        oy = random.randint(0, holgura_h) if holgura_h > 0 else 0
+        ox = random.randint(0, holgura_w) if holgura_w > 0 else 0
+    else:
+        oy, ox = offset
+    return arr[:, oy:oy + out_size, ox:ox + out_size]
 
-    def __init__(self, items, train, mean, std, n_frames=16, zoom=1.0):
+
+def _offset_centrado(store_size, out_size):
+    h = (store_size - out_size) // 2
+    return (h, h)
+
+
+class TubeDataset(Dataset):
+    """Tubos ya vienen recortados con el marco final (STORE_SIZE=256) desde la
+    cosecha (pose_pipeline.py + harvest_pose_test.py, o su version real) -- el
+    zoom/marco queda CONGELADO ahi, ya no es un parametro de este dataset (a
+    diferencia del dataset viejo). Lo unico que se hace aca es ventanear
+    (slice puro 256->224, ver _ventanea_np) para la augmentation de posicion."""
+
+    STORE_SIZE = 256
+    OUT_SIZE = 224
+
+    def __init__(self, items, train, mean, std, n_frames=16):
         self.items = items
         self.train = train
         self.mean = torch.tensor(mean).view(3, 1, 1, 1)
         self.std = torch.tensor(std).view(3, 1, 1, 1)
         self.n_frames = n_frames
-        self.zoom = zoom
 
     def __len__(self):
         return len(self.items)
@@ -91,51 +116,22 @@ class TubeDataset(Dataset):
             arr = arr[idx]
         arr = arr.copy()
 
-        # Recorte espacial: ANTES eran dos recortes anidados (zoom jitter ±8%
-        # sobre self.zoom, y despues un segundo crop aleatorio 78-100% de ESE
-        # resultado) resueltos con un unico resize final a 224. Un solo resize
-        # de verdad necesita un solo recorte: se sortea UNA ventana (tamano +
-        # posicion) por muestra, con un rango de tamano que cubre aprox. el
-        # mismo intervalo que el viejo par anidado (zoom*[0.78,1.08], en vez
-        # de zoom*[0.92,1.08] seguido de otro *[0.78,1.0]) y un jitter de
-        # posicion (~11% del lado) equivalente al desplazamiento maximo que el
-        # crop anidado viejo permitia. No es una reproduccion estadistica
-        # exacta del esquema anterior -- ese era justamente el problema, dos
-        # aleatoriedades encadenadas son dificiles de razonar -- pero cubre un
-        # rango de aumento comparable con una sola operacion, auditable.
-        L0 = arr.shape[1]
         if self.train:
-            z = float(np.clip(self.zoom * random.uniform(0.78, 1.08), 0.35, 1.0))
-            side = int(round(L0 * z))
-            max_off = int(round(0.11 * side))
-            cy = L0 // 2 + (random.randint(-max_off, max_off) if max_off else 0)
-            cx = L0 // 2 + (random.randint(-max_off, max_off) if max_off else 0)
-            y0 = int(np.clip(cy - side // 2, 0, L0 - side))
-            x0 = int(np.clip(cx - side // 2, 0, L0 - side))
-            arr = np.ascontiguousarray(arr[:, y0:y0+side, x0:x0+side])
-
             if random.random() < 0.5:
                 arr = self._fake_circle(arr)
             if random.random() < 0.30:
                 arr = self._fake_blur(arr)
             if random.random() < 0.5:
                 arr = arr[:, :, ::-1]  # flip H
-        elif self.zoom < 1.0:
-            # equivalente EXACTO (mismos enteros, sin azar) al viejo par de
-            # recortes centrados en eval: zoom centrado + margen 6.25% del
-            # resultado colapsados en un solo recorte centrado.
-            side1 = int(round(L0 * self.zoom))
-            o1 = (L0 - side1) // 2
-            m = int(side1 * 0.0625)
-            side = side1 - 2 * m
-            off = o1 + m
-            arr = np.ascontiguousarray(arr[:, off:off+side, off:off+side])
+
+        # Ventaneo: slice puro STORE_SIZE(256) -> OUT_SIZE(224), sin resize --
+        # augmentation de posicion en train (offset aleatorio), centrado en
+        # eval. El zoom/marco ya viene fijo desde la cosecha, no se toca aca.
+        offset = None if self.train else _offset_centrado(self.STORE_SIZE, self.OUT_SIZE)
+        arr = _ventanea_np(arr, self.OUT_SIZE, offset=offset)
 
         x = torch.from_numpy(np.ascontiguousarray(arr)).float() / 255.0  # T,H,W,C
         x = x.permute(3, 0, 1, 2)  # C,T,H,W
-        if x.shape[-1] != 224:
-            x = torch.nn.functional.interpolate(x, size=(224, 224), mode="bilinear",
-                                                align_corners=False)
         if self.train:
             # Augmentación de APARIENCIA. Con solo ~6 actores en el dataset (uno
             # de ellos el 59%), el modelo puede agarrarse a "esta persona/ropa =

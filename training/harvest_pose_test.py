@@ -109,14 +109,18 @@ def main():
     clips = sorted(glob.glob(os.path.join(args.carpeta_videos, "*.mp4")))
     print(f"{len(clips)} clips en {args.carpeta_videos}")
 
-    # anotaciones.csv: UNA sola tabla (npy, clase, split, marco, ventana,
-    # clip_origen) -- reemplaza el manifest.csv de antes. "clase" sigue
-    # ALEATORIA (no hay labeling real todavia, ver docstring del modulo);
-    # "split" tambien es un sorteo simple por ahora -- para el dataset real
-    # conviene separar por clip/dia/camara de origen, no al azar por tubo,
-    # para no filtrar frames del mismo evento entre train y val.
+    # anotaciones.csv: UNA sola tabla (npy,clase,split,marco,ventana,clip_origen)
+    # -- reemplaza el manifest.csv de antes, y es el esquema FINAL que espera
+    # training/train.py::load_index() (columnas "clase"/"split" tal cual, sin
+    # sufijo) -- asi no hace falta tocar train.py cuando lleguen labels reales,
+    # solo reemplazar esta tabla. Por AHORA "clase" y "split" son un sorteo
+    # (ver el aviso en cada fila mas abajo, y el docstring del modulo) -- no
+    # hay labeling real todavia, y el split real deberia separarse por
+    # clip/dia/camara de origen, no al azar por tubo (para no filtrar el
+    # mismo evento entre train y val).
+    print("AVISO: clase y split en anotaciones.csv son un sorteo -- no hay labeling real todavia")
     anot = open(os.path.join(args.out_dir, "anotaciones.csv"), "w")
-    anot.write("npy,clase_ALEATORIA,split_ALEATORIO,marco,ventana,clip_origen\n")
+    anot.write("npy,clase,split,marco,ventana,clip_origen\n")
 
     n_ok = n_skip = 0
     for clip in clips:
