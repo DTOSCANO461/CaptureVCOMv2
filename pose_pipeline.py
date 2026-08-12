@@ -18,14 +18,16 @@ usando PoseC3D), pero con las diferencias que pidio el usuario:
     barato: sin pesos que promediar, solo indexado).
 
 Filosofia del recorte (ver bbox_desde_keypoints / recorta_y_redimensiona_gpu /
-ventanea): el "marco" (padding) alrededor del bbox de la persona queda FIJO
+ventanea): el "marco" (multiplicador sobre el bbox de keypoints) queda FIJO
 al construir cada tubo -- es lo unico que congela el zoom, tanto en inferencia
-como al generar el dataset (una vez guardado un .npy, ese zoom no se puede
-recuperar sin volver al video crudo). La data augmentation de POSICION
-(offset) se resuelve aparte, con un slice puro (sin resize) sobre un tubo
-guardado a STORE_SIZE=256 en vez de OUT_SIZE=224 -- 32px de holgura, numeros
-enteros limpios. En inferencia no hace falta holgura: se resuelve directo a
-224 en el unico resize.
+(MARCO_INFERENCIA=1.05, siempre igual) como al generar el dataset (ahi el
+llamador sortea un marco entre MARCO_MIN_TRAIN=1.0 y MARCO_MAX_TRAIN=1.1 por
+tubo -- la augmentation de zoom in/out -- y una vez guardado el .npy ese zoom
+ya no se puede recuperar sin volver al video crudo). La data augmentation de
+POSICION (offset) se resuelve aparte, con un slice puro (sin resize) sobre un
+tubo guardado a STORE_SIZE=256 en vez de OUT_SIZE=224 -- 32px de holgura,
+numeros enteros limpios. En inferencia no hace falta holgura: se resuelve
+directo a 224 en el unico resize.
 """
 import numpy as np
 import torch
@@ -33,29 +35,39 @@ import torch.nn.functional as F
 
 N_FRAMES = 16                  # VideoMAE (el ejemplo de referencia usa 32, para PoseC3D)
 NUM_KEYPOINTS = 17             # COCO-17, salida de yolo*-pose
-PADDING = 0.5                  # margen proporcional sobre el bbox TIGHT de keypoints (side =
-                                # lado_mayor_del_esqueleto * (1+padding)). PLACEHOLDER: pendiente
-                                # de que se defina el valor real -- no calibrado contra nada, ver
-                                # bbox_desde_keypoints() para la formula exacta.
+
+# MARCO: multiplicador DIRECTO sobre el lado mayor del bbox tight de keypoints
+# (side = lado_mayor_del_esqueleto * marco). marco=1.0 -> ventana pegada al
+# esqueleto, sin margen. marco=1.05 -> 5% mas grande que el esqueleto.
+MARCO_INFERENCIA = 1.05        # fijo, siempre el mismo recorte en produccion
+MARCO_MIN_TRAIN = 1.0          # rango de sorteo al generar el dataset (zoom in/out,
+MARCO_MAX_TRAIN = 1.1          # se congela por tubo al guardar el .npy -- ver docstring del modulo)
+
 OUT_SIZE = 224                 # resolucion de entrada de VideoMAE
 STORE_SIZE = 256               # tamano al que se guardan los tubos de ENTRENAMIENTO:
                                 # 224 + 32 de holgura -> el offset de la ventana (Paso de
                                 # augmentation) desliza en [0,32] en cada eje, sin resize extra.
 
 
-def bbox_desde_keypoints(kp_clip, frame_w, frame_h, padding=PADDING):
+def bbox_desde_keypoints(kp_clip, frame_w, frame_h, marco=MARCO_INFERENCIA):
     """kp_clip: (T,17,2) en pixeles nativos, (0,0) donde el keypoint no es valido
     (mismo criterio que el motor YOLO-pose / ejemplo_poses.py: x<=0.01 o y<=0.01
     se tratan como invalidos).
 
     bbox TIGHT ajustado a TODOS los keypoints validos del clip completo (no
     por frame): de mano a mano, de cabeza a pies visibles -- sin margen
-    todavia. `padding` multiplica el lado mayor de ese bbox por (1+padding)
-    para dar el lado final del recorte (ventana SIEMPRE cuadrada: el chico
-    de VideoMAE necesita 224x224, no un rectangulo).
+    todavia. `marco` es el multiplicador DIRECTO sobre el lado mayor de ese
+    bbox (side = lado_mayor * marco; marco=1.0 = pegado al esqueleto,
+    marco=1.05 = 5% mas grande) -- ventana SIEMPRE cuadrada, el chico de
+    VideoMAE necesita 224x224, no un rectangulo.
+
+    En inferencia `marco` es fijo (MARCO_INFERENCIA). Al generar el dataset
+    de entrenamiento, el llamador sortea `marco` entre MARCO_MIN_TRAIN y
+    MARCO_MAX_TRAIN por tubo (augmentation de zoom in/out) y lo pasa aca --
+    esta funcion no sortea nada, solo aplica el valor que le dan.
 
     Garantiza devolver una ventana de exactamente `side x side` (side =
-    round(lado*(1+padding)), clampado a min(frame_w,frame_h) si hiciera
+    round(lado_mayor*marco), clampado a min(frame_w,frame_h) si hiciera
     falta): en vez de centrar y despues recortar cada borde contra el frame
     por separado (eso rompe la simetria y puede achicar el lado cerca de un
     borde), primero se fija el tamano y LUEGO se desliza la posicion para
@@ -74,7 +86,7 @@ def bbox_desde_keypoints(kp_clip, frame_w, frame_h, padding=PADDING):
     cx, cy = (min_x + max_x) / 2, (min_y + max_y) / 2
 
     lado_mayor = max(max_x - min_x, max_y - min_y)
-    side = lado_mayor * (1 + padding)
+    side = lado_mayor * marco
     side = min(side, min(frame_w, frame_h))    # nunca mas grande que el frame -> el deslizamiento de abajo siempre alcanza
     side_i = int(round(side))
     if side_i <= 0:
