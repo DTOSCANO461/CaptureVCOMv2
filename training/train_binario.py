@@ -272,6 +272,14 @@ def main():
     json.dump(log, open(os.path.join(run_dir, "log.json"), "w"), indent=1)
 
     best_auc = auc0
+    n_batches = len(dl_tr)
+    # Progreso EN VIVO dentro de la epoca (no solo al final de cada una) --
+    # pedido explicito, datasets grandes (66k+ tubos) tardan minutos por
+    # epoca y sin esto el log queda mudo todo ese tiempo. ~20 actualizaciones
+    # por epoca: print de linea normal (no barra tipo tqdm con \r) porque
+    # esto corre en background via nohup y se sigue con tail/grep sobre el
+    # log, no en una TTY -- \r no se ve bien ahi.
+    log_every = max(1, n_batches // 20)
     for ep in range(args.epochs):
         model.train()
         t0, losses = time.time(), []
@@ -288,6 +296,13 @@ def main():
                 scaler.update()
                 opt.zero_grad(set_to_none=True)
                 sched.step()
+            if (step + 1) % log_every == 0 or (step + 1) == n_batches:
+                frac = (step + 1) / n_batches
+                elapsed = time.time() - t0
+                eta_ep = elapsed / frac - elapsed
+                print(f"  ep {ep+1}/{args.epochs}  step {step+1}/{n_batches} ({frac*100:.0f}%)  "
+                      f"loss_running={np.mean(losses):.4f}  "
+                      f"transcurrido={elapsed/60:.1f}min  eta_epoca={eta_ep/60:.1f}min", flush=True)
         auc, ap_, _, _ = evaluate(model, dl_va, device)
         dt = time.time() - t0
         print(f"ep {ep+1}/{args.epochs} loss {np.mean(losses):.4f} "
