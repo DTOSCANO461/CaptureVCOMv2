@@ -230,6 +230,26 @@ def build_model(name):
 
 # ────────────────────────── entrenamiento ──────────────────────────
 
+def loss_mse_continuo(logits, y):
+    """Alternativa CONTINUA a CrossEntropyLoss, pedida explicitamente
+    ("no quiero una funcion binaria de error sino algo continuo, minimos
+    cuadrados"): error cuadratico medio entre softmax(logits) y el
+    one-hot del label real -- es el Brier score, la version "minimos
+    cuadrados" de un problema de clasificacion (a diferencia de CE, que
+    es log-verosimilitud, no distancia euclidea).
+
+    RETROCOMPATIBLE a proposito: la cabeza sigue siendo NUM_CLASES=2
+    logits (nada cambia en build_model/TubeDataset/evaluate), asi que
+    inferencia_pose_comun.ModeloPoseGPU, inferencia_pose_test_binario.py y
+    tools/procesa_offline_binario.py siguen andando tal cual con un
+    checkpoint entrenado asi -- softmax(logits)[:,1] sigue siendo P(hurto),
+    lo unico que cambia es COMO se penaliza el error durante el
+    entrenamiento, no la forma de la salida."""
+    probs = torch.softmax(logits.float(), dim=1)
+    y_onehot = torch.nn.functional.one_hot(y, num_classes=NUM_CLASES).float()
+    return torch.nn.functional.mse_loss(probs, y_onehot)
+
+
 def evaluate(model, loader, device):
     """Binario: AUC/AP sobre la probabilidad de la clase 1 (hurto) -- "como
     la original" (ver commit 025af04, antes de pasar a multiclase), en vez
@@ -258,6 +278,11 @@ def main():
     ap.add_argument("--accum", type=int, default=5)
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--workers", type=int, default=5)
+    ap.add_argument("--loss", choices=["ce", "mse"], default="ce",
+                     help="ce = CrossEntropyLoss (default, sin cambios respecto a antes). "
+                          "mse = loss_mse_continuo(), Brier score sobre softmax(logits) vs "
+                          "one-hot -- experimento pedido explicitamente, misma cabeza de "
+                          "NUM_CLASES logits, retrocompatible con toda la inferencia existente.")
     args = ap.parse_args()
 
     torch.manual_seed(0)
@@ -300,7 +325,8 @@ def main():
     sched = torch.optim.lr_scheduler.OneCycleLR(
         opt, max_lr=args.lr, total_steps=total_steps, pct_start=0.1)
     scaler = torch.amp.GradScaler()
-    crit = nn.CrossEntropyLoss(label_smoothing=0.05)
+    crit = nn.CrossEntropyLoss(label_smoothing=0.05) if args.loss == "ce" else loss_mse_continuo
+    print(f"[loss] {args.loss}", flush=True)
 
     # Baseline sin entrenar, "ep": 0 -- mismo criterio que train.py, para
     # poder comparar el salto real en las graficas despues.
