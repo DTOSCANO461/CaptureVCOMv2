@@ -185,6 +185,46 @@ def build_model(name):
         m = mvit_v2_s(weights=MViT_V2_S_Weights.KINETICS400_V1)
         m.head[1] = nn.Linear(m.head[1].in_features, NUM_CLASES)
         return m, [0.45, 0.45, 0.45], [0.225, 0.225, 0.225]
+    elif name == "videomaev2":
+        # OpenGVLab/VideoMAEv2-Base -- NO existe como clase nativa en
+        # transformers (solo V1, "videomae" arriba). El checkpoint trae su
+        # propio modeling_videomaev2.py/modeling_config.py (auto_map en su
+        # config.json) que HF ejecuta via trust_remote_code=True. Revisado a
+        # mano el contenido de esos dos archivos antes de habilitar esto ac
+        # (ViT/BEiT estandar, sin llamadas de red/os, nada sospechoso) --
+        # nunca se activa este flag para un repo sin revisar antes.
+        # requiere `easydict` y `timm` instalados (dependencias declaradas
+        # por el propio checkpoint, ya presentes en este entorno).
+        #
+        # Confirmado en la practica (ver commit): num_frames=16 en el
+        # config del checkpoint -- pedido explicito, coincide con N_FRAMES
+        # del resto del pipeline sin tener que tocar nada. tubelet_size=2 ->
+        # 8 tokens temporales. embed_dim=768, 86M params (misma escala que
+        # videomae-base). El checkpoint se publica como backbone DESNUDO
+        # (num_classes=0 en su config, "head": Identity) -- reset_classifier()
+        # es un metodo propio del modelo, agrega la cabeza de clasificacion
+        # fine-tuneable (NUM_CLASES=2 aca).
+        #
+        # A diferencia de V1 (que necesita el Wrap de arriba: HF espera
+        # pixel_values en B,T,C,H,W), este modelo toma (B,C,T,H,W) DIRECTO
+        # -- exactamente lo que ya entrega TubeDataset.__getitem__, sin
+        # permute ni wrapper.
+        #
+        # Normalizacion: mean=std=0.5 en los 3 canales (no ImageNet) --
+        # asi se preentreno (ver _cfg() en modeling_videomaev2.py).
+        from transformers import AutoModel, AutoConfig
+        CKPT_VMAE2 = "OpenGVLab/VideoMAEv2-Base"
+        cfg = AutoConfig.from_pretrained(CKPT_VMAE2, trust_remote_code=True)
+        n_frames_ckpt = cfg.model_config["num_frames"]
+        assert n_frames_ckpt == 16, (
+            f"OpenGVLab/VideoMAEv2-Base cambio a num_frames={n_frames_ckpt} (se esperaba 16, "
+            f"pedido explicito) -- revisar antes de entrenar, la pos_embed del checkpoint "
+            f"esta atada a ese numero de frames.")
+        m = AutoModel.from_pretrained(CKPT_VMAE2, trust_remote_code=True)
+        m.model.reset_classifier(NUM_CLASES)
+        print(f"[modelo] {CKPT_VMAE2} (trust_remote_code) -- backbone 86M params, "
+              f"num_frames={n_frames_ckpt}, cabeza nueva de {NUM_CLASES} clases")
+        return m, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]
     raise ValueError(name)
 
 
@@ -212,7 +252,7 @@ def evaluate(model, loader, device):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", choices=["videomae", "mvit"], required=True)
+    ap.add_argument("--model", choices=["videomae", "mvit", "videomaev2"], required=True)
     ap.add_argument("--epochs", type=int, default=15)
     ap.add_argument("--bs", type=int, default=6)
     ap.add_argument("--accum", type=int, default=5)

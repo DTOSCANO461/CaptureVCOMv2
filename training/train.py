@@ -195,6 +195,25 @@ def build_model(name):
         m = mvit_v2_s(weights=MViT_V2_S_Weights.KINETICS400_V1)
         m.head[1] = nn.Linear(m.head[1].in_features, NUM_CLASES)
         return m, [0.45, 0.45, 0.45], [0.225, 0.225, 0.225]
+    elif name == "videomaev2":
+        # OpenGVLab/VideoMAEv2-Base -- ver el docstring identico en
+        # training/train_binario.py::build_model() para el detalle completo
+        # (por que trust_remote_code=True, que se reviso a mano, num_frames=16
+        # confirmado, input (B,C,T,H,W) directo sin Wrap, normalizacion 0.5).
+        # NUM_CLASES aca es 70 (multiclase), no 2.
+        from transformers import AutoModel, AutoConfig
+        CKPT_VMAE2 = "OpenGVLab/VideoMAEv2-Base"
+        cfg = AutoConfig.from_pretrained(CKPT_VMAE2, trust_remote_code=True)
+        n_frames_ckpt = cfg.model_config["num_frames"]
+        assert n_frames_ckpt == 16, (
+            f"OpenGVLab/VideoMAEv2-Base cambio a num_frames={n_frames_ckpt} (se esperaba 16, "
+            f"pedido explicito) -- revisar antes de entrenar, la pos_embed del checkpoint "
+            f"esta atada a ese numero de frames.")
+        m = AutoModel.from_pretrained(CKPT_VMAE2, trust_remote_code=True)
+        m.model.reset_classifier(NUM_CLASES)
+        print(f"[modelo] {CKPT_VMAE2} (trust_remote_code) -- backbone 86M params, "
+              f"num_frames={n_frames_ckpt}, cabeza nueva de {NUM_CLASES} clases")
+        return m, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]
     raise ValueError(name)
 
 
@@ -226,7 +245,7 @@ def evaluate(model, loader, device):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", choices=["videomae", "mvit"], required=True)
+    ap.add_argument("--model", choices=["videomae", "mvit", "videomaev2"], required=True)
     ap.add_argument("--epochs", type=int, default=15)
     ap.add_argument("--bs", type=int, default=6)
     ap.add_argument("--accum", type=int, default=5)
