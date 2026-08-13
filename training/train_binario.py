@@ -117,6 +117,46 @@ class TubeDataset(Dataset):
             arr[i][y:y+bh, x:x+bw] = cv2.GaussianBlur(roi, (k, k), 0)
         return arr
 
+    def _rotate(self, arr):
+        """Rotacion leve (+-15 grados), UNA sola matriz para los T frames --
+        tiene que ser la misma en todo el tubo (si cada frame rotara
+        distinto se rompe la coherencia temporal que el modelo aprende).
+        BORDER_REFLECT101 en vez de negro para no meter un artefacto de
+        borde negro constante que el modelo podria aprender como shortcut."""
+        import cv2
+        t, h, w, _ = arr.shape
+        ang = random.uniform(-15, 15)
+        M = cv2.getRotationMatrix2D((w / 2, h / 2), ang, 1.0)
+        out = np.empty_like(arr)
+        for i in range(t):
+            out[i] = cv2.warpAffine(arr[i], M, (w, h), borderMode=cv2.BORDER_REFLECT101)
+        return out
+
+    def _distorsion(self, arr):
+        """Distorsion de perspectiva leve (jitter de esquinas ~6% del lado),
+        misma transformacion para los T frames por el mismo motivo que
+        _rotate. Simula angulo/lente de camara real, no solo encuadre
+        rectangular perfecto."""
+        import cv2
+        t, h, w, _ = arr.shape
+        jitter = 0.06
+        src = np.float32([[0, 0], [w, 0], [0, h], [w, h]])
+        dst = (src + np.random.uniform(-jitter, jitter, src.shape) * np.array([w, h])).astype(np.float32)
+        M = cv2.getPerspectiveTransform(src, dst)
+        out = np.empty_like(arr)
+        for i in range(t):
+            out[i] = cv2.warpPerspective(arr[i], M, (w, h), borderMode=cv2.BORDER_REFLECT101)
+        return out
+
+    def _canal_swap(self, arr):
+        """Permuta al azar los 3 canales de color (RGB -> alguna de las 6
+        permutaciones) -- rompe el atajo de "este color de ropa/piel =
+        hurto" sin tocar la geometria del tubo, mismo espiritu que la
+        ganancia por canal de mas abajo pero mas agresivo (permutacion
+        entera, no solo escalado)."""
+        perm = np.random.permutation(3)
+        return arr[:, :, :, perm]
+
     def __getitem__(self, i):
         it = self.items[i]
         arr = np.load(it["npy"])  # (16,256,256,3) uint8 RGB
@@ -126,12 +166,18 @@ class TubeDataset(Dataset):
         arr = arr.copy()
 
         if self.train:
-            if random.random() < 0.5:
+            if random.random() < 0.55:
                 arr = self._fake_circle(arr)
-            if random.random() < 0.30:
+            if random.random() < 0.35:
                 arr = self._fake_blur(arr)
             if random.random() < 0.5:
                 arr = arr[:, :, ::-1]  # flip H
+            if random.random() < 0.30:
+                arr = self._rotate(arr)
+            if random.random() < 0.25:
+                arr = self._distorsion(arr)
+            if random.random() < 0.20:
+                arr = self._canal_swap(arr)
 
         offset = None if self.train else _offset_centrado(self.STORE_SIZE, self.OUT_SIZE)
         arr = _ventanea_np(arr, self.OUT_SIZE, offset=offset)
@@ -139,12 +185,12 @@ class TubeDataset(Dataset):
         x = torch.from_numpy(np.ascontiguousarray(arr)).float() / 255.0  # T,H,W,C
         x = x.permute(3, 0, 1, 2)  # C,T,H,W
         if self.train:
-            if random.random() < 0.8:
-                x = x * (0.65 + 0.7*random.random())              # brillo
+            if random.random() < 0.85:
+                x = x * (0.55 + 0.9*random.random())              # brillo, rango ensanchado
                 m = x.mean()
-                x = (x - m) * (0.65 + 0.7*random.random()) + m    # contraste
-            if random.random() < 0.6:
-                g = torch.tensor([0.75 + 0.5*random.random() for _ in range(3)]).view(3, 1, 1, 1)
+                x = (x - m) * (0.55 + 0.9*random.random()) + m    # contraste, rango ensanchado
+            if random.random() < 0.65:
+                g = torch.tensor([0.65 + 0.7*random.random() for _ in range(3)]).view(3, 1, 1, 1)
                 x = x * g
             if random.random() < 0.20:
                 x = x.mean(0, keepdim=True).repeat(3, 1, 1, 1)    # gris
