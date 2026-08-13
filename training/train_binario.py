@@ -268,8 +268,20 @@ def build_model(name):
             f"esta atada a ese numero de frames.")
         m = AutoModel.from_pretrained(CKPT_VMAE2, trust_remote_code=True)
         m.model.reset_classifier(NUM_CLASES)
+        # with_cp=True: gradient/activation checkpointing, YA VIENE COMO
+        # ATRIBUTO del modelo (VisionTransformer.with_cp -> forward_features
+        # usa torch.utils.checkpoint.checkpoint(blk, x) si esta prendido).
+        # Necesario aca -- el codigo custom del checkpoint calcula atencion
+        # "a mano" (q@k.T + softmax + @v) sin el kernel fusionado/flash-attn
+        # que si usa la implementacion de V1 en transformers, con 1568
+        # tokens por tubo (8 temporales x 196 espaciales) eso se come la
+        # VRAM: probado en la practica, bs=6 SIN with_cp tira
+        # CUDA OutOfMemoryError (~12GB antes de completar ni un batch,
+        # ver commit); CON with_cp, mismo bs=6, pico real medido 3.4GB.
+        m.model.with_cp = True
         print(f"[modelo] {CKPT_VMAE2} (trust_remote_code) -- backbone 86M params, "
-              f"num_frames={n_frames_ckpt}, cabeza nueva de {NUM_CLASES} clases")
+              f"num_frames={n_frames_ckpt}, cabeza nueva de {NUM_CLASES} clases, "
+              f"with_cp=True (gradient checkpointing, necesario por VRAM)")
         return m, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]
     raise ValueError(name)
 

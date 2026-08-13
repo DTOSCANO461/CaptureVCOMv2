@@ -257,8 +257,14 @@ def build_model(name):
             f"esta atada a ese numero de frames.")
         m = AutoModel.from_pretrained(CKPT_VMAE2, trust_remote_code=True)
         m.model.reset_classifier(NUM_CLASES)
+        # with_cp=True: gradient checkpointing -- ver el comentario identico
+        # en train_binario.py::build_model() para el detalle completo
+        # (atencion "a mano" del codigo custom, sin flash-attn; sin esto
+        # tira CUDA OutOfMemoryError con bs=6, con esto pico medido 3.4GB).
+        m.model.with_cp = True
         print(f"[modelo] {CKPT_VMAE2} (trust_remote_code) -- backbone 86M params, "
-              f"num_frames={n_frames_ckpt}, cabeza nueva de {NUM_CLASES} clases")
+              f"num_frames={n_frames_ckpt}, cabeza nueva de {NUM_CLASES} clases, "
+              f"with_cp=True (gradient checkpointing, necesario por VRAM)")
         return m, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]
     raise ValueError(name)
 
