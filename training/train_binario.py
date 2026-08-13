@@ -296,6 +296,33 @@ def loss_mse_continuo(logits, y):
     return torch.nn.functional.mse_loss(probs, y_onehot)
 
 
+def loss_bce_normal(logits, y):
+    """La funcion "normal" de clasificacion BINARIA (pedida explicitamente
+    para distinguirla de loss_mse_continuo de arriba): Binary Cross-Entropy
+    de libro, -[y*log(p) + (1-y)*log(1-p)], sobre p = softmax(logits)[:,1]
+    (P(hurto)). Distinta de --loss ce (CrossEntropyLoss generica, pensada
+    para N clases) aunque para 2 clases ambas optimizan un objetivo
+    relacionado -- de hecho matematicamente CASI identica a CE sin
+    label_smoothing (verificado a mano: softmax de 2 clases + CE ==
+    sigmoid + BCE sobre la diferencia de logits) -- BCE es simplemente la
+    formula especifica de libro/tutorial para un problema binario puro.
+
+    RETROCOMPATIBLE igual que loss_mse_continuo: la cabeza sigue siendo
+    NUM_CLASES=2 logits, nada cambia en build_model/TubeDataset/evaluate ni
+    en la inferencia existente -- solo cambia la formula de la loss.
+
+    Implementada como binary_cross_entropy_with_logits sobre la DIFERENCIA
+    de logits (logit_1 - logit_0), matematicamente identico a BCE sobre
+    softmax(logits)[:,1] (softmax de 2 clases == sigmoid de la diferencia),
+    pero numericamente estable y AUTOCAST-SAFE -- probado en la practica:
+    binary_cross_entropy "plano" sobre una probabilidad ya pasada por
+    softmax tira RuntimeError dentro de torch.autocast (bug de seguridad
+    de PyTorch, no un error de esta funcion: "unsafe to autocast", pide
+    exactamente este cambio en el mensaje)."""
+    logit_diff = (logits[:, 1] - logits[:, 0]).float()
+    return torch.nn.functional.binary_cross_entropy_with_logits(logit_diff, y.float())
+
+
 def evaluate(model, loader, device):
     """Binario: AUC/AP sobre la probabilidad de la clase 1 (hurto) -- "como
     la original" (ver commit 025af04, antes de pasar a multiclase), en vez
@@ -324,11 +351,13 @@ def main():
     ap.add_argument("--accum", type=int, default=5)
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--workers", type=int, default=5)
-    ap.add_argument("--loss", choices=["ce", "mse"], default="ce",
+    ap.add_argument("--loss", choices=["ce", "mse", "bce"], default="ce",
                      help="ce = CrossEntropyLoss (default, sin cambios respecto a antes). "
                           "mse = loss_mse_continuo(), Brier score sobre softmax(logits) vs "
-                          "one-hot -- experimento pedido explicitamente, misma cabeza de "
-                          "NUM_CLASES logits, retrocompatible con toda la inferencia existente.")
+                          "one-hot -- continuo, minimos cuadrados. "
+                          "bce = loss_bce_normal(), Binary Cross-Entropy de libro sobre P(hurto). "
+                          "Las tres mantienen la misma cabeza de NUM_CLASES logits, retrocompatibles "
+                          "con toda la inferencia existente.")
     args = ap.parse_args()
 
     torch.manual_seed(0)
@@ -371,7 +400,11 @@ def main():
     sched = torch.optim.lr_scheduler.OneCycleLR(
         opt, max_lr=args.lr, total_steps=total_steps, pct_start=0.1)
     scaler = torch.amp.GradScaler()
-    crit = nn.CrossEntropyLoss(label_smoothing=0.05) if args.loss == "ce" else loss_mse_continuo
+    crit = {
+        "ce": nn.CrossEntropyLoss(label_smoothing=0.05),
+        "mse": loss_mse_continuo,
+        "bce": loss_bce_normal,
+    }[args.loss]
     print(f"[loss] {args.loss}", flush=True)
 
     # Baseline sin entrenar, "ep": 0 -- mismo criterio que train.py, para
