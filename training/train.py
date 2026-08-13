@@ -212,30 +212,56 @@ class TubeDataset(Dataset):
 
 # ────────────────────────── modelos ──────────────────────────
 
+class _WrapVideoMAE(nn.Module):
+    """HF VideoMAEForVideoClassification espera pixel_values en B,T,C,H,W."""
+    def __init__(self, m):
+        super().__init__()
+        self.m = m
+
+    def forward(self, x):  # x: B,C,T,H,W
+        return self.m(pixel_values=x.permute(0, 2, 1, 3, 4)).logits
+
+
+def _carga_videomae_bin_manual(mid, num_labels):
+    """Ver docstring identico en train_binario.py::build_model() -- bypass
+    del bloqueo de transformers a torch.load para checkpoints que SOLO
+    traen pytorch_model.bin (caso: MCG-NJU/videomae-small-finetuned-kinetics),
+    exige torch>=2.6 aun con weights_only=True (tenemos 2.5.1). weights_only=True
+    ya es la parte segura (evita ejecucion de codigo via pickle)."""
+    from huggingface_hub import hf_hub_download
+    from transformers import VideoMAEConfig, VideoMAEForVideoClassification
+    path = hf_hub_download(mid, "pytorch_model.bin")
+    sd = torch.load(path, map_location="cpu", weights_only=True)
+    cfg = VideoMAEConfig.from_pretrained(mid, num_labels=num_labels)
+    m = VideoMAEForVideoClassification(cfg)
+    sd.pop("classifier.weight", None)
+    sd.pop("classifier.bias", None)
+    missing, unexpected = m.load_state_dict(sd, strict=False)
+    assert set(missing) <= {"classifier.weight", "classifier.bias"}, f"missing inesperado: {missing}"
+    assert not unexpected, f"unexpected: {unexpected}"
+    return m
+
+
 def build_model(name):
     if name == "videomae":
         from transformers import VideoMAEForVideoClassification
-        last_err = None
-        for mid in ["MCG-NJU/videomae-small-finetuned-kinetics400",
-                    "MCG-NJU/videomae-base-finetuned-kinetics"]:
-            try:
-                m = VideoMAEForVideoClassification.from_pretrained(
-                    mid, num_labels=NUM_CLASES, ignore_mismatched_sizes=True)
-                print(f"[modelo] {mid}")
-                mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
-                # HF espera (B,T,C,H,W)
-                class Wrap(nn.Module):
-                    def __init__(self, m):
-                        super().__init__()
-                        self.m = m
-
-                    def forward(self, x):  # x: B,C,T,H,W
-                        return self.m(pixel_values=x.permute(0, 2, 1, 3, 4)).logits
-                return Wrap(m), mean, std
-            except Exception as e:
-                last_err = e
-                print(f"[modelo] {mid} no disponible: {str(e)[:100]}")
-        raise last_err
+        mid = "MCG-NJU/videomae-base-finetuned-kinetics"
+        m = VideoMAEForVideoClassification.from_pretrained(
+            mid, num_labels=NUM_CLASES, ignore_mismatched_sizes=True)
+        print(f"[modelo] {mid}")
+        mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+        return _WrapVideoMAE(m), mean, std
+    elif name == "videomae-small":
+        # ID correcto es SIN el "400" final -- ver comentario identico en
+        # train_binario.py::build_model() para el detalle completo (typo
+        # heredado, todas las corridas "videomae" hasta ahora entrenaron
+        # base, nunca small de verdad; ademas ese repo solo trae
+        # pytorch_model.bin, ver _carga_videomae_bin_manual()).
+        mid = "MCG-NJU/videomae-small-finetuned-kinetics"
+        m = _carga_videomae_bin_manual(mid, NUM_CLASES)
+        print(f"[modelo] {mid} -- {sum(p.numel() for p in m.parameters())/1e6:.1f}M params")
+        mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+        return _WrapVideoMAE(m), mean, std
     elif name == "mvit":
         from torchvision.models.video import mvit_v2_s, MViT_V2_S_Weights
         m = mvit_v2_s(weights=MViT_V2_S_Weights.KINETICS400_V1)
@@ -297,7 +323,7 @@ def evaluate(model, loader, device):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", choices=["videomae", "mvit", "videomaev2"], required=True)
+    ap.add_argument("--model", choices=["videomae", "videomae-small", "mvit", "videomaev2"], required=True)
     ap.add_argument("--epochs", type=int, default=15)
     ap.add_argument("--bs", type=int, default=6)
     ap.add_argument("--accum", type=int, default=5)
