@@ -262,6 +262,17 @@ def build_model(name):
         print(f"[modelo] {mid} -- {sum(p.numel() for p in m.parameters())/1e6:.1f}M params")
         mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
         return _WrapVideoMAE(m), mean, std
+    elif name == "videomae-large":
+        # Ver comentario identico en train_binario.py::build_model() --
+        # 304M params, trae model.safetensors (sin workaround), probado sin
+        # gradient checkpointing con bs=6, pico real 11.4GB de VRAM.
+        from transformers import VideoMAEForVideoClassification
+        mid = "MCG-NJU/videomae-large-finetuned-kinetics"
+        m = VideoMAEForVideoClassification.from_pretrained(
+            mid, num_labels=NUM_CLASES, ignore_mismatched_sizes=True)
+        print(f"[modelo] {mid} -- {sum(p.numel() for p in m.parameters())/1e6:.1f}M params")
+        mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+        return _WrapVideoMAE(m), mean, std
     elif name == "mvit":
         from torchvision.models.video import mvit_v2_s, MViT_V2_S_Weights
         m = mvit_v2_s(weights=MViT_V2_S_Weights.KINETICS400_V1)
@@ -323,7 +334,7 @@ def evaluate(model, loader, device):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", choices=["videomae", "videomae-small", "mvit", "videomaev2"], required=True)
+    ap.add_argument("--model", choices=["videomae", "videomae-small", "videomae-large", "mvit", "videomaev2"], required=True)
     ap.add_argument("--epochs", type=int, default=15)
     ap.add_argument("--bs", type=int, default=6)
     ap.add_argument("--accum", type=int, default=5)

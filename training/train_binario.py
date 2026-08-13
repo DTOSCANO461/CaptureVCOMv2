@@ -259,6 +259,22 @@ def build_model(name):
         print(f"[modelo] {mid} -- {sum(p.numel() for p in m.parameters())/1e6:.1f}M params")
         mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
         return _WrapVideoMAE(m), mean, std
+    elif name == "videomae-large":
+        # A diferencia de "small", este repo SI trae model.safetensors --
+        # from_pretrained normal, sin el workaround de _carga_videomae_bin_manual.
+        # 304M params (ViT-Large, ~3.5x base). Probado en la practica: bs=6,
+        # SIN gradient checkpointing (a diferencia de videomaev2 -- este es
+        # el codigo nativo de transformers, usa el kernel de atencion
+        # fusionado/sdpa por default, no la implementacion "a mano" del
+        # custom de VideoMAEv2), pico real medido 11.4GB de VRAM -- entra
+        # holgado en una placa de 16GB, no hace falta with_cp aca.
+        from transformers import VideoMAEForVideoClassification
+        mid = "MCG-NJU/videomae-large-finetuned-kinetics"
+        m = VideoMAEForVideoClassification.from_pretrained(
+            mid, num_labels=NUM_CLASES, ignore_mismatched_sizes=True)
+        print(f"[modelo] {mid} -- {sum(p.numel() for p in m.parameters())/1e6:.1f}M params")
+        mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+        return _WrapVideoMAE(m), mean, std
     elif name == "mvit":
         from torchvision.models.video import mvit_v2_s, MViT_V2_S_Weights
         m = mvit_v2_s(weights=MViT_V2_S_Weights.KINETICS400_V1)
@@ -390,7 +406,7 @@ def evaluate(model, loader, device):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", choices=["videomae", "videomae-small", "mvit", "videomaev2"], required=True)
+    ap.add_argument("--model", choices=["videomae", "videomae-small", "videomae-large", "mvit", "videomaev2"], required=True)
     ap.add_argument("--epochs", type=int, default=15)
     ap.add_argument("--bs", type=int, default=6)
     ap.add_argument("--accum", type=int, default=5)
