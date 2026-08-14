@@ -9,9 +9,12 @@ lo unico nuevo aca es COMO SE ELIGEN LOS CLIPS A PROCESAR:
   - Recorre TODAS las subcarpetas de <videos_root> que sean un dataset_tipo
     conocido (labeling_strategy.FPS_POR_CARPETA), no una sola carpeta fija.
   - Antes de tocar un .mp4, chequea que su tamaño en disco este ESTABLE
-    (mismo st_size en dos lecturas separadas por --estable-seg) -- si todavia
-    esta subiendo/escribiendose, se salta y se reintenta mas tarde. Sin esto,
-    leer un .mp4 a medio subir con cv2 puede dar un video corto/corrupto.
+    (mismo st_size visto en dos PASADAS de escaneo separadas por al menos
+    --estable-seg -- ver RastreadorEstabilidad, SIN time.sleep() bloqueante
+    por archivo, eso fue un error de la primera version que tapaba casi todo
+    el throughput real) -- si todavia esta subiendo/escribiendose, se salta y
+    se reintenta en la proxima pasada. Sin esto, leer un .mp4 a medio subir
+    con cv2 puede dar un video corto/corrupto.
   - Si en una pasada completa no aparece NINGUN clip nuevo y estable, espera
     --poll-seg y vuelve a escanear (los nuevos archivos van apareciendo via
     upload externo) -- hasta --idle-max-seg de inactividad total, momento en
@@ -71,19 +74,40 @@ def tubos_ya_generados(anotaciones_path):
         return sum(1 for _ in csv.DictReader(f))
 
 
-def es_archivo_estable(path, espera_seg):
-    """True si el tamaño no cambio entre dos lecturas separadas por
-    espera_seg -- criterio simple de "ya termino de subir/escribirse"."""
-    try:
-        s0 = os.path.getsize(path)
-    except OSError:
-        return False
-    time.sleep(espera_seg)
-    try:
-        s1 = os.path.getsize(path)
-    except OSError:
-        return False
-    return s0 == s1 and s0 > 0
+class RastreadorEstabilidad:
+    """Detecta ".mp4 ya termino de subir/escribirse" SIN bloquear con
+    time.sleep() por archivo (eso fue un error de la primera version --
+    con miles de archivos, dormir 3s por cada uno revisado tapaba
+    practicamente todo el throughput real de decode+pose, sin importar
+    cuanto se optimizara el resto).
+
+    En vez de eso: se guarda (tamaño, timestamp) de la ULTIMA vez que se vio
+    cada archivo. Cada pasada de escaneo separa naturalmente esas lecturas
+    por el tiempo que toma procesar el resto de los clips de la pasada
+    anterior (tipicamente varios segundos) -- si el tamaño no cambio Y ya
+    paso al menos `espera_seg` desde que se vio por primera vez con ese
+    tamaño, se considera estable. Un archivo nuevo (nunca visto) NUNCA se
+    procesa en la misma pasada en que aparece -- como minimo espera a la
+    pasada siguiente, que ya es tiempo mas que suficiente en la practica."""
+
+    def __init__(self, espera_seg):
+        self.espera_seg = espera_seg
+        self._visto = {}   # path -> (size, primera_vez_con_ese_size)
+
+    def es_estable(self, path):
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return False
+        ahora = time.time()
+        prev = self._visto.get(path)
+        if prev is None or prev[0] != size:
+            self._visto[path] = (size, ahora)
+            return False
+        return size > 0 and (ahora - prev[1]) >= self.espera_seg
+
+    def olvidar(self, path):
+        self._visto.pop(path, None)
 
 
 def descubrir_carpetas(videos_root):
@@ -144,6 +168,7 @@ def main():
 
     n_skip = 0
     idle_desde = None   # timestamp desde el que no se encuentra nada nuevo, None = recien encontramos algo
+    rastreador = RastreadorEstabilidad(args.estable_seg)
 
     print(f"Objetivo: {args.target_tubos} tubos | ya tengo {n_ok}")
 
@@ -162,10 +187,11 @@ def main():
                 clip_origen = f"{dataset_tipo}/{nombre_base_clip}"
                 if clip_origen in ya_procesados:
                     continue
-                if not es_archivo_estable(clip, args.estable_seg):
-                    continue   # todavia subiendo (o recien llegado) -- se reintenta en la proxima pasada
+                if not rastreador.es_estable(clip):
+                    continue   # todavia subiendo, o recien detectado -- se reintenta en la proxima pasada
 
                 encontro_algo_esta_pasada = True
+                rastreador.olvidar(clip)   # ya se va a marcar como procesado, no hace falta seguir rastreandolo
                 idle_desde = None
                 nombre_clip = os.path.splitext(nombre_base_clip)[0]
                 marco = round(random.uniform(pp.MARCO_MIN_TRAIN, pp.MARCO_MAX_TRAIN), 3)

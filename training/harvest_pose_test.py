@@ -123,6 +123,26 @@ def keypoints_por_frame_max_confianza(modelo_pose, frame_bgr):
     return res.keypoints.xy.cpu().numpy()[idx_mejor]   # (17,2)
 
 
+def keypoints_por_ventana_batch(modelo_pose, frames_bgr):
+    """Igual que aplicar keypoints_por_frame_max_confianza a cada frame de
+    `frames_bgr` (lista de ~32 frames), pero en UNA sola llamada a
+    modelo_pose.predict() con la lista completa -- ultralytics batchea
+    internamente. Medido en vivo: llamar predict() por frame (32 llamadas
+    Python+CUDA-launch separadas por clip) es el cuello de botella real de
+    la cosecha, no el forward del modelo en si -- batchear da varias veces
+    mas throughput sin cambiar el criterio de seleccion por frame (maxima
+    confianza), que se sigue aplicando exactamente igual, solo que sobre el
+    Results de cada imagen del batch en vez de una sola."""
+    resultados = modelo_pose.predict(frames_bgr, conf=0.2, verbose=False)
+    salida = np.zeros((len(frames_bgr), pp.NUM_KEYPOINTS, 2), dtype=np.float32)
+    for i, res in enumerate(resultados):
+        if res.boxes is None or res.boxes.conf.shape[0] == 0 or res.keypoints is None:
+            continue
+        idx_mejor = int(res.boxes.conf.cpu().numpy().argmax())
+        salida[i] = res.keypoints.xy.cpu().numpy()[idx_mejor]
+    return salida
+
+
 FPS_OBJETIVO = 25 / 3   # ~8.33 -- "acercar todo a 8fps" pedido explicitamente
 
 
@@ -157,7 +177,7 @@ def extrae_tubo(modelo_pose, clip, marco, fps, n_frames=pp.N_FRAMES):
     if len(idx_ventana) < 4:
         idx_ventana = list(range(n))   # mismo fallback que harvest_v14.py: si la ventana quedo muy chica, usar todo el clip
 
-    kp_clip = np.stack([keypoints_por_frame_max_confianza(modelo_pose, frames[i]) for i in idx_ventana])
+    kp_clip = keypoints_por_ventana_batch(modelo_pose, [frames[i] for i in idx_ventana])
     ventana = pp.bbox_desde_keypoints(kp_clip, w, h, marco=marco)
     if ventana is None:
         return None, None, None
