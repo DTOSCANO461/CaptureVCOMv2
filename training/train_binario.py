@@ -34,8 +34,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 
-ROOT = "/home/tomis/SBT/DATASETS"
-RUNS = os.path.join(ROOT, "train", "runs")
+ROOT = "/media/mulinux/T5001/smartvcom2/CaptureVCOMv2-main/salida_offline/dataset_todo_binario"
+RUNS = os.path.join(ROOT, "runs_aug")
 
 NUM_CLASES = 2
 
