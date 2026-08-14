@@ -58,6 +58,8 @@ def main():
     ap.add_argument("--pose-model", default="yolo11m-pose.pt")
     ap.add_argument("--guardar-videos", action="store_true")
     ap.add_argument("--val-frac", type=float, default=0.15)
+    ap.add_argument("--n-frames", type=int, default=32,
+                     help="frames por tubo -- ver --n-frames en harvest_pose_test.py")
     args = ap.parse_args()
 
     carpetas = sorted(
@@ -108,7 +110,7 @@ def main():
         marco = round(random.uniform(hpt.pp.MARCO_MIN_TRAIN, hpt.pp.MARCO_MAX_TRAIN), 3)
 
         try:
-            tubo, ventana, total_frames = hpt.extrae_tubo(modelo_pose, clip, marco, fps)
+            tubo, ventana, total_frames = hpt.extrae_tubo(modelo_pose, clip, marco, fps, n_frames=args.n_frames)
         except Exception as e:
             print("ERR", clip, e)
             tubo = None

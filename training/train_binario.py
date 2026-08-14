@@ -90,6 +90,35 @@ class TubeDataset(Dataset):
         self.mean = torch.tensor(mean).view(3, 1, 1, 1)
         self.std = torch.tensor(std).view(3, 1, 1, 1)
         self.n_frames = n_frames
+        self._avisado_resample = False   # __getitem__ corre en workers separados
+        # (num_workers de DataLoader) -- este flag es por-proceso, asi que el
+        # aviso puede imprimirse hasta N_WORKERS veces, no una sola, pero eso
+        # ya alcanza para que sea visible sin ser spam por-tubo.
+
+        # Verificacion al armar el dataset: el .npy de cada tubo puede tener
+        # 16 O 32 frames guardados (segun con que --n-frames se cosecho, ver
+        # harvest_pose_test.py) -- el modelo (build_model) siempre necesita
+        # exactamente self.n_frames. Ac se hace un MUESTREO (no las 66k+ filas
+        # enteras, seria leer todos los .npy solo para esto) para avisar de
+        # entrada si el dataset esta mezclado o si difiere de lo que pide el
+        # modelo, en vez de descubrirlo silenciosamente tubo a tubo durante
+        # el entrenamiento.
+        if items:
+            muestra = random.sample(items, min(50, len(items)))
+            conteo = {}
+            for it in muestra:
+                try:
+                    frames_reales = np.load(it["npy"], mmap_mode="r").shape[0]
+                except Exception:
+                    continue
+                conteo[frames_reales] = conteo.get(frames_reales, 0) + 1
+            distinto = {k: v for k, v in conteo.items() if k != n_frames}
+            print(f"[dataset] modelo necesita n_frames={n_frames} -- muestra de {len(muestra)} "
+                  f"tubos, frames reales encontrados: {conteo}"
+                  + (f"  -- AVISO: {sum(distinto.values())}/{len(muestra)} NO coinciden, "
+                     f"se van a resamplear (linspace) al cargar, no son frames reales adicionales/"
+                     f"descartados sin mas" if distinto else " (todos coinciden, sin resample)"),
+                  flush=True)
 
     def __len__(self):
         return len(self.items)
@@ -159,8 +188,12 @@ class TubeDataset(Dataset):
 
     def __getitem__(self, i):
         it = self.items[i]
-        arr = np.load(it["npy"])  # (16,256,256,3) uint8 RGB
+        arr = np.load(it["npy"])  # (16 o 32,256,256,3) uint8 RGB -- depende de --n-frames al cosechar
         if arr.shape[0] != self.n_frames:
+            if not self._avisado_resample:
+                print(f"[dataset] resampleando (linspace) tubo con {arr.shape[0]} frames reales "
+                      f"-> {self.n_frames} pedidos por el modelo (ej: {it['npy']})", flush=True)
+                self._avisado_resample = True
             idx = np.linspace(0, arr.shape[0]-1, self.n_frames).round().astype(int)
             arr = arr[idx]
         arr = arr.copy()
@@ -212,7 +245,7 @@ class _WrapVideoMAE(nn.Module):
         return self.m(pixel_values=x.permute(0, 2, 1, 3, 4)).logits
 
 
-def _carga_videomae_bin_manual(mid, num_labels):
+def _carga_videomae_bin_manual(mid, num_labels, num_frames=16):
     """Bypass del bloqueo de transformers a torch.load para checkpoints que
     SOLO traen pytorch_model.bin (no model.safetensors) -- caso real:
     MCG-NJU/videomae-small-finetuned-kinetics. transformers>=4.5x exige
@@ -228,7 +261,10 @@ def _carga_videomae_bin_manual(mid, num_labels):
     from transformers import VideoMAEConfig, VideoMAEForVideoClassification
     path = hf_hub_download(mid, "pytorch_model.bin")
     sd = torch.load(path, map_location="cpu", weights_only=True)
-    cfg = VideoMAEConfig.from_pretrained(mid, num_labels=num_labels)
+    # num_frames: la position embedding (ver commit --frames) se recalcula
+    # sola desde el config, sinusoidal fija, NUNCA se guarda en pytorch_model.bin
+    # -- pedir un num_frames distinto al del checkpoint no rompe el load_state_dict de abajo.
+    cfg = VideoMAEConfig.from_pretrained(mid, num_labels=num_labels, num_frames=num_frames)
     m = VideoMAEForVideoClassification(cfg)
     sd.pop("classifier.weight", None)
     sd.pop("classifier.bias", None)
@@ -254,31 +290,38 @@ _VIDEOMAE_ARCH = {
 }
 
 
-def _build_videomae_scratch(name, num_labels):
+def _build_videomae_scratch(name, num_labels, num_frames=16):
     from transformers import VideoMAEConfig, VideoMAEForVideoClassification
     cfg = VideoMAEConfig(
-        image_size=224, patch_size=16, num_channels=3, num_frames=16, tubelet_size=2,
+        image_size=224, patch_size=16, num_channels=3, num_frames=num_frames, tubelet_size=2,
         num_labels=num_labels, **_VIDEOMAE_ARCH[name],
     )
     m = VideoMAEForVideoClassification(cfg)  # random init -- sin from_pretrained
     print(f"[modelo] {name} SCRATCH (random init, sin checkpoint preentrenado) -- "
-          f"{sum(p.numel() for p in m.parameters())/1e6:.1f}M params")
+          f"{sum(p.numel() for p in m.parameters())/1e6:.1f}M params, num_frames={num_frames}")
     return m
 
 
-def build_model(name, scratch=False):
+def build_model(name, scratch=False, frames=16):
     if scratch:
         assert name in _VIDEOMAE_ARCH, (
             f"--scratch solo soportado para {list(_VIDEOMAE_ARCH)} (familia VideoMAE V1) por ahora")
-        m = _build_videomae_scratch(name, NUM_CLASES)
+        m = _build_videomae_scratch(name, NUM_CLASES, num_frames=frames)
         mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
         return _WrapVideoMAE(m), mean, std
     if name == "videomae":
-        from transformers import VideoMAEForVideoClassification
+        # num_frames: la position embedding (sinusoidal fija) se recalcula
+        # SIEMPRE desde el config al construirse, nunca se carga del
+        # checkpoint (confirmado a mano: no aparece en su state_dict) --
+        # pedir --frames 32 contra un checkpoint entrenado a 16 no tira
+        # error de shapes ni corrompe nada, solo cambia cuantos tokens
+        # temporales ve el modelo.
+        from transformers import VideoMAEConfig, VideoMAEForVideoClassification
         mid = "MCG-NJU/videomae-base-finetuned-kinetics"
+        cfg = VideoMAEConfig.from_pretrained(mid, num_labels=NUM_CLASES, num_frames=frames)
         m = VideoMAEForVideoClassification.from_pretrained(
-            mid, num_labels=NUM_CLASES, ignore_mismatched_sizes=True)
-        print(f"[modelo] {mid}")
+            mid, config=cfg, ignore_mismatched_sizes=True)
+        print(f"[modelo] {mid} -- num_frames={frames}")
         mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
         return _WrapVideoMAE(m), mean, std
     elif name == "videomae-small":
@@ -289,8 +332,8 @@ def build_model(name, scratch=False):
         # verdad). Ademas ese repo solo trae pytorch_model.bin -- ver
         # _carga_videomae_bin_manual().
         mid = "MCG-NJU/videomae-small-finetuned-kinetics"
-        m = _carga_videomae_bin_manual(mid, NUM_CLASES)
-        print(f"[modelo] {mid} -- {sum(p.numel() for p in m.parameters())/1e6:.1f}M params")
+        m = _carga_videomae_bin_manual(mid, NUM_CLASES, num_frames=frames)
+        print(f"[modelo] {mid} -- {sum(p.numel() for p in m.parameters())/1e6:.1f}M params, num_frames={frames}")
         mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
         return _WrapVideoMAE(m), mean, std
     elif name == "videomae-large":
@@ -301,12 +344,15 @@ def build_model(name, scratch=False):
         # el codigo nativo de transformers, usa el kernel de atencion
         # fusionado/sdpa por default, no la implementacion "a mano" del
         # custom de VideoMAEv2), pico real medido 11.4GB de VRAM -- entra
-        # holgado en una placa de 16GB, no hace falta with_cp aca.
-        from transformers import VideoMAEForVideoClassification
+        # holgado en una placa de 16GB, no hace falta with_cp aca. Con
+        # --frames 32 la secuencia se duplica (mas VRAM) -- si se necesita
+        # gradient checkpointing a 32 frames, prenderlo a mano como en "h".
+        from transformers import VideoMAEConfig, VideoMAEForVideoClassification
         mid = "MCG-NJU/videomae-large-finetuned-kinetics"
+        cfg = VideoMAEConfig.from_pretrained(mid, num_labels=NUM_CLASES, num_frames=frames)
         m = VideoMAEForVideoClassification.from_pretrained(
-            mid, num_labels=NUM_CLASES, ignore_mismatched_sizes=True)
-        print(f"[modelo] {mid} -- {sum(p.numel() for p in m.parameters())/1e6:.1f}M params")
+            mid, config=cfg, ignore_mismatched_sizes=True)
+        print(f"[modelo] {mid} -- {sum(p.numel() for p in m.parameters())/1e6:.1f}M params, num_frames={frames}")
         mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
         return _WrapVideoMAE(m), mean, std
     elif name == "videomae-h":
@@ -328,10 +374,10 @@ def build_model(name, scratch=False):
         # HF que usa el resto de VideoMAEForVideoClassification, no el with_cp
         # a mano de v2).
         mid = "MCG-NJU/videomae-huge-finetuned-kinetics"
-        m = _carga_videomae_bin_manual(mid, NUM_CLASES)
+        m = _carga_videomae_bin_manual(mid, NUM_CLASES, num_frames=frames)
         m.gradient_checkpointing_enable()
         print(f"[modelo] {mid} -- {sum(p.numel() for p in m.parameters())/1e6:.1f}M params "
-              f"(gradient checkpointing ON)")
+              f"(gradient checkpointing ON), num_frames={frames}")
         mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
         return _WrapVideoMAE(m), mean, std
     elif name == "mvit":
@@ -378,9 +424,16 @@ def build_model(name, scratch=False):
         n_frames_ckpt = cfg.model_config["num_frames"]
         assert n_frames_ckpt == 16, (
             f"{CKPT_VMAE2} cambio a num_frames={n_frames_ckpt} (se esperaba 16, "
-            f"pedido explicito) -- revisar antes de entrenar, la pos_embed del checkpoint "
-            f"esta atada a ese numero de frames.")
-        m = AutoModel.from_pretrained(CKPT_VMAE2, trust_remote_code=True)
+            f"pedido explicito) -- revisar antes de entrenar, algo del checkpoint cambio.")
+        # --frames: igual que en V1, el pos_embed (get_sinusoid_encoding_table
+        # en modeling_videomaev2.py) es un tensor plano, NO nn.Parameter/buffer
+        # -- no aparece en el state_dict del checkpoint (confirmado a mano),
+        # se recalcula solo desde cfg.model_config["num_frames"] al construir.
+        # Pisar ese valor aca (en vez de dejar el 16 nativo del checkpoint) es
+        # seguro por la misma razon que en V1.
+        if frames != n_frames_ckpt:
+            cfg.model_config["num_frames"] = frames
+        m = AutoModel.from_pretrained(CKPT_VMAE2, config=cfg, trust_remote_code=True)
         m.model.reset_classifier(NUM_CLASES)
         # with_cp=True: gradient/activation checkpointing, YA VIENE COMO
         # ATRIBUTO del modelo (VisionTransformer.with_cp -> forward_features
@@ -395,8 +448,8 @@ def build_model(name, scratch=False):
         m.model.with_cp = True
         n_params = sum(p.numel() for p in m.parameters()) / 1e6
         print(f"[modelo] {CKPT_VMAE2} (trust_remote_code) -- backbone {n_params:.1f}M params, "
-              f"num_frames={n_frames_ckpt}, cabeza nueva de {NUM_CLASES} clases, "
-              f"with_cp=True (gradient checkpointing, necesario por VRAM)")
+              f"num_frames={frames} (checkpoint nativo: {n_frames_ckpt}), cabeza nueva de "
+              f"{NUM_CLASES} clases, with_cp=True (gradient checkpointing, necesario por VRAM)")
         return m, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]
     raise ValueError(name)
 
@@ -474,6 +527,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", choices=["videomae", "videomae-small", "videomae-large", "videomae-h",
                                          "mvit", "videomaev2", "videomaev2-large", "videomaev2-h"], required=True)
+    ap.add_argument("--frames", type=int, default=16, choices=[16, 32],
+                     help="Cantidad de frames por tubo que el modelo espera (solo familia "
+                          "VideoMAE v1/v2 -- mvit no se toca aca). Verificado a mano: tanto "
+                          "VideoMAEForVideoClassification (v1) como el AutoModel de VideoMAEv2 "
+                          "recalculan su position embedding SIEMPRE desde el config al construirse "
+                          "(sinusoidal fijo, nunca se carga del checkpoint), asi que pedir 32 "
+                          "frames con un checkpoint preentrenado a 16 no tira error de shapes ni "
+                          "corrompe nada -- ver commit. TubeDataset detecta solo cuantos frames "
+                          "tiene cada .npy real y resamplea (linspace) si no coincide con esto, "
+                          "asi que mezclar tubos de 16 y 32 en el mismo dataset no rompe nada.")
     ap.add_argument("--scratch", action="store_true",
                      help="Arma la arquitectura de --model (solo familia VideoMAE V1) con pesos random "
                           "(init estandar de transformers, sin from_pretrained) en vez de partir del "
@@ -525,11 +588,11 @@ def main():
     n_pos_tr = sum(1 for i in tr if i["label"] == 1)
     print(f"train {len(tr)} (hurto {n_pos_tr}) | val {len(va)} (hurto {sum(1 for i in va if i['label']==1)})")
 
-    model, mean, std = build_model(args.model, scratch=args.scratch)
+    model, mean, std = build_model(args.model, scratch=args.scratch, frames=args.frames)
     model.to(device)
 
-    ds_tr = TubeDataset(tr, True, mean, std)
-    ds_va = TubeDataset(va, False, mean, std)
+    ds_tr = TubeDataset(tr, True, mean, std, n_frames=args.frames)
+    ds_va = TubeDataset(va, False, mean, std, n_frames=args.frames)
     # sampler balanceado hurto/normal -- misma logica que la version original
     # (n_pos/n_neg en vez del conteo_clase generico de train.py, aca solo hay 2)
     n_pos = n_pos_tr

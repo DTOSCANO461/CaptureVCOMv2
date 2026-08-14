@@ -14,8 +14,8 @@ usando PoseC3D), pero con las diferencias que pidio el usuario:
   - Decodifica con cv2.VideoCapture (PyNvVideoCodec, usado en ejemplo_poses.py,
     no esta disponible en este entorno) -- el resto del pipeline (deteccion de
     pose, calculo de la ventana, resize) es igual de GPU-nativo.
-  - UN SOLO resize, con torch (`F.interpolate`, modo "nearest" -- el mas
-    barato: sin pesos que promediar, solo indexado).
+  - UN SOLO resize, con torch (`F.interpolate`, modo "bilinear" -- promedia
+    pixeles vecinos, mas fiel que "nearest" aunque un poco mas caro).
 
 Filosofia del recorte (ver bbox_desde_keypoints / recorta_y_redimensiona_gpu /
 ventanea): el "marco" (multiplicador sobre el bbox de keypoints) queda FIJO
@@ -103,10 +103,18 @@ def recorta_y_redimensiona_gpu(frames_gpu, ventana, out_size, n_frames=N_FRAMES)
     gp.make_tube_gpu: linspace uniforme sobre los frames disponibles).
     ventana: (x0,y0,x1,y1) en pixeles nativos, de bbox_desde_keypoints.
 
-    UN SOLO resize (nearest) del recorte crudo -> (out_size,out_size).
+    UN SOLO resize (bilinear) del recorte crudo -> (out_size,out_size).
     out_size=STORE_SIZE (256) para generar tubos de entrenamiento;
     out_size=OUT_SIZE (224) para inferencia, directo a la red -- misma
     funcion, un solo parametro distinto.
+
+    bilinear en vez de nearest (pedido explicito): promedia los pixeles
+    vecinos en vez de solo indexar el mas cercano -- bordes/texturas quedan
+    suavizados en vez de "escalonados", mas parecido a como VideoMAE fue
+    preentrenado/evaluado rio arriba (resize bilineal es el estandar en casi
+    todo pipeline de vision, nearest era la opcion mas barata en compute, no
+    la de mejor calidad). align_corners=False es el default recomendado por
+    PyTorch para bilinear (evita el sesgo de medio pixel en los bordes).
     """
     x0, y0, x1, y1 = ventana
     idx = torch.linspace(0, len(frames_gpu) - 1, n_frames).round().long()
@@ -114,7 +122,7 @@ def recorta_y_redimensiona_gpu(frames_gpu, ventana, out_size, n_frames=N_FRAMES)
     salida = []
     for i in idx.tolist():
         recorte = frames_gpu[i][:, y0:y1, x0:x1].float().unsqueeze(0)   # 1,3,h,w
-        redim = F.interpolate(recorte, size=(out_size, out_size), mode="nearest")
+        redim = F.interpolate(recorte, size=(out_size, out_size), mode="bilinear", align_corners=False)
         salida.append(redim.squeeze(0).clamp(0, 255).to(torch.uint8))
     return torch.stack(salida)     # (n_frames,3,out_size,out_size) uint8 RGB
 

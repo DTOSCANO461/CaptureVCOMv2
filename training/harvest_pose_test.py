@@ -126,7 +126,7 @@ def keypoints_por_frame_max_confianza(modelo_pose, frame_bgr):
 FPS_OBJETIVO = 25 / 3   # ~8.33 -- "acercar todo a 8fps" pedido explicitamente
 
 
-def extrae_tubo(modelo_pose, clip, marco, fps):
+def extrae_tubo(modelo_pose, clip, marco, fps, n_frames=pp.N_FRAMES):
     cap = cv2.VideoCapture(clip)
     w, h = int(cap.get(3)), int(cap.get(4))
     frames_todos = []
@@ -163,7 +163,7 @@ def extrae_tubo(modelo_pose, clip, marco, fps):
         return None, None, None
 
     frames_gpu = [frame_a_gpu(frames[i]) for i in idx_ventana]
-    tubo_store = pp.recorta_y_redimensiona_gpu(frames_gpu, ventana, out_size=pp.STORE_SIZE)
+    tubo_store = pp.recorta_y_redimensiona_gpu(frames_gpu, ventana, out_size=pp.STORE_SIZE, n_frames=n_frames)
     return tubo_store, ventana, len(frames_todos)
 
 
@@ -178,6 +178,13 @@ def main():
                           f"{PROB_VIDEO_QA*100:.0f}%% (inspeccion visual del recorte)")
     ap.add_argument("--val-frac", type=float, default=0.15,
                      help="fraccion de clips que se van a split=val (aleatorio, ver aviso abajo)")
+    ap.add_argument("--n-frames", type=int, default=32,
+                     help="frames por tubo (default 32, antes 16 -- pedido explicito para poder "
+                          "usar los checkpoints VideoMAE a 32 frames/mayor resolucion temporal, "
+                          "ver docstring de pose_pipeline.N_FRAMES). training/train_binario.py "
+                          "detecta solo cuantos frames tiene cada .npy y resamplea si hace falta, "
+                          "asi que mezclar tubos de 16 y 32 frames en el mismo dataset no rompe "
+                          "nada, pero conviene ser consistente por corrida de cosecha.")
     args = ap.parse_args()
 
     dataset_tipo = os.path.basename(os.path.normpath(args.carpeta_videos))
@@ -224,7 +231,7 @@ def main():
         marco = round(random.uniform(pp.MARCO_MIN_TRAIN, pp.MARCO_MAX_TRAIN), 3)
 
         try:
-            tubo, ventana, total_frames = extrae_tubo(modelo_pose, clip, marco, fps)
+            tubo, ventana, total_frames = extrae_tubo(modelo_pose, clip, marco, fps, n_frames=args.n_frames)
         except Exception as e:
             print("ERR", clip, e)
             tubo = None
