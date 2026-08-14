@@ -238,7 +238,41 @@ def _carga_videomae_bin_manual(mid, num_labels):
     return m
 
 
-def build_model(name):
+# Dimensiones de arquitectura de cada tamano de VideoMAE V1 (ViT-S/B/L/H) --
+# son solo hiperparametros (hidden_size/num_hidden_layers/num_attention_heads/
+# intermediate_size), no pesos ni contenido creativo de MCG-NJU, confirmados
+# a mano contra el config.json de cada checkpoint ya cacheado localmente.
+# Usados SOLO para --scratch: arman la arquitectura vacia (random init) sin
+# tocar para nada el repo de MCG-NJU en runtime (ni pesos NI config.json) --
+# asi el modelo resultante no tiene ninguna dependencia de un checkpoint
+# CC-BY-NC-4.0, se entrena 100% desde los datos propios.
+_VIDEOMAE_ARCH = {
+    "videomae-small": dict(hidden_size=384, num_hidden_layers=12, num_attention_heads=16, intermediate_size=1536),
+    "videomae": dict(hidden_size=768, num_hidden_layers=12, num_attention_heads=12, intermediate_size=3072),
+    "videomae-large": dict(hidden_size=1024, num_hidden_layers=24, num_attention_heads=16, intermediate_size=4096),
+    "videomae-h": dict(hidden_size=1280, num_hidden_layers=32, num_attention_heads=16, intermediate_size=5120),
+}
+
+
+def _build_videomae_scratch(name, num_labels):
+    from transformers import VideoMAEConfig, VideoMAEForVideoClassification
+    cfg = VideoMAEConfig(
+        image_size=224, patch_size=16, num_channels=3, num_frames=16, tubelet_size=2,
+        num_labels=num_labels, **_VIDEOMAE_ARCH[name],
+    )
+    m = VideoMAEForVideoClassification(cfg)  # random init -- sin from_pretrained
+    print(f"[modelo] {name} SCRATCH (random init, sin checkpoint preentrenado) -- "
+          f"{sum(p.numel() for p in m.parameters())/1e6:.1f}M params")
+    return m
+
+
+def build_model(name, scratch=False):
+    if scratch:
+        assert name in _VIDEOMAE_ARCH, (
+            f"--scratch solo soportado para {list(_VIDEOMAE_ARCH)} (familia VideoMAE V1) por ahora")
+        m = _build_videomae_scratch(name, NUM_CLASES)
+        mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+        return _WrapVideoMAE(m), mean, std
     if name == "videomae":
         from transformers import VideoMAEForVideoClassification
         mid = "MCG-NJU/videomae-base-finetuned-kinetics"
@@ -275,12 +309,37 @@ def build_model(name):
         print(f"[modelo] {mid} -- {sum(p.numel() for p in m.parameters())/1e6:.1f}M params")
         mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
         return _WrapVideoMAE(m), mean, std
+    elif name == "videomae-h":
+        # VideoMAE V1 Huge -- MCG-NJU/videomae-huge-finetuned-kinetics,
+        # ~630M params (ViT-Huge, ~2x "large"). Igual que "small" (y a
+        # diferencia de "large"), este repo SOLO trae pytorch_model.bin, no
+        # model.safetensors (confirmado via HfApi().model_info: .gitattributes,
+        # README.md, config.json, preprocessor_config.json, pytorch_model.bin)
+        # -- probado en la practica: from_pretrained normal tira ValueError
+        # ("Due to a serious vulnerability issue in torch.load...") porque
+        # transformers>=4.5x bloquea torch.load sobre .bin sin torch>=2.6 (aca
+        # 2.5.1), asi que hace falta el mismo workaround de
+        # _carga_videomae_bin_manual() que "small".
+        #
+        # "large" midio 11.4GB de VRAM SIN gradient checkpointing en la placa
+        # de 16GB -- Huge tiene el doble de parametros y capas mas anchas, no
+        # entra holgado sin esto, asi que a diferencia de "large" aca se
+        # prende gradient checkpointing por default (mismo mecanismo nativo de
+        # HF que usa el resto de VideoMAEForVideoClassification, no el with_cp
+        # a mano de v2).
+        mid = "MCG-NJU/videomae-huge-finetuned-kinetics"
+        m = _carga_videomae_bin_manual(mid, NUM_CLASES)
+        m.gradient_checkpointing_enable()
+        print(f"[modelo] {mid} -- {sum(p.numel() for p in m.parameters())/1e6:.1f}M params "
+              f"(gradient checkpointing ON)")
+        mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+        return _WrapVideoMAE(m), mean, std
     elif name == "mvit":
         from torchvision.models.video import mvit_v2_s, MViT_V2_S_Weights
         m = mvit_v2_s(weights=MViT_V2_S_Weights.KINETICS400_V1)
         m.head[1] = nn.Linear(m.head[1].in_features, NUM_CLASES)
         return m, [0.45, 0.45, 0.45], [0.225, 0.225, 0.225]
-    elif name == "videomaev2":
+    elif name in ("videomaev2", "videomaev2-large", "videomaev2-h"):
         # OpenGVLab/VideoMAEv2-Base -- NO existe como clase nativa en
         # transformers (solo V1, "videomae" arriba). El checkpoint trae su
         # propio modeling_videomaev2.py/modeling_config.py (auto_map en su
@@ -307,12 +366,18 @@ def build_model(name):
         #
         # Normalizacion: mean=std=0.5 en los 3 canales (no ImageNet) --
         # asi se preentreno (ver _cfg() en modeling_videomaev2.py).
+        # "large"/"h" -- mismos modeling_videomaev2.py/modeling_config.py que
+        # "Base" (diff byte a byte contra el ya revisado, confirmado a mano
+        # antes de habilitar esto), solo cambia el tamano del backbone
+        # (embed_dim/depth/num_heads via su config.json) -- mismo
+        # trust_remote_code ya auditado, no hace falta revisar de nuevo.
         from transformers import AutoModel, AutoConfig
-        CKPT_VMAE2 = "OpenGVLab/VideoMAEv2-Base"
+        TAM_VMAE2 = {"videomaev2": "Base", "videomaev2-large": "Large", "videomaev2-h": "Huge"}[name]
+        CKPT_VMAE2 = f"OpenGVLab/VideoMAEv2-{TAM_VMAE2}"
         cfg = AutoConfig.from_pretrained(CKPT_VMAE2, trust_remote_code=True)
         n_frames_ckpt = cfg.model_config["num_frames"]
         assert n_frames_ckpt == 16, (
-            f"OpenGVLab/VideoMAEv2-Base cambio a num_frames={n_frames_ckpt} (se esperaba 16, "
+            f"{CKPT_VMAE2} cambio a num_frames={n_frames_ckpt} (se esperaba 16, "
             f"pedido explicito) -- revisar antes de entrenar, la pos_embed del checkpoint "
             f"esta atada a ese numero de frames.")
         m = AutoModel.from_pretrained(CKPT_VMAE2, trust_remote_code=True)
@@ -328,7 +393,8 @@ def build_model(name):
         # CUDA OutOfMemoryError (~12GB antes de completar ni un batch,
         # ver commit); CON with_cp, mismo bs=6, pico real medido 3.4GB.
         m.model.with_cp = True
-        print(f"[modelo] {CKPT_VMAE2} (trust_remote_code) -- backbone 86M params, "
+        n_params = sum(p.numel() for p in m.parameters()) / 1e6
+        print(f"[modelo] {CKPT_VMAE2} (trust_remote_code) -- backbone {n_params:.1f}M params, "
               f"num_frames={n_frames_ckpt}, cabeza nueva de {NUM_CLASES} clases, "
               f"with_cp=True (gradient checkpointing, necesario por VRAM)")
         return m, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]
@@ -406,8 +472,24 @@ def evaluate(model, loader, device):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", choices=["videomae", "videomae-small", "videomae-large", "mvit", "videomaev2"], required=True)
+    ap.add_argument("--model", choices=["videomae", "videomae-small", "videomae-large", "videomae-h",
+                                         "mvit", "videomaev2", "videomaev2-large", "videomaev2-h"], required=True)
+    ap.add_argument("--scratch", action="store_true",
+                     help="Arma la arquitectura de --model (solo familia VideoMAE V1) con pesos random "
+                          "(init estandar de transformers, sin from_pretrained) en vez de partir del "
+                          "checkpoint preentrenado de MCG-NJU -- sin ninguna dependencia de su licencia "
+                          "CC-BY-NC-4.0, se entrena 100% desde el dataset propio. Los resultados se "
+                          "guardan en runs/<model>-scratch/, NO pisa la corrida con checkpoint.")
     ap.add_argument("--epochs", type=int, default=15)
+    ap.add_argument("--patience", type=int, default=3,
+                     help="Early stopping: corta el entrenamiento si val_auc no mejora (respecto al "
+                          "mejor visto hasta ahora) en N epocas seguidas. 0 = desactivado, corre las "
+                          "--epochs completas siempre.")
+    ap.add_argument("--loss-delta-stop", type=float, default=0.0,
+                     help="Early stopping ALTERNATIVO, sobre el loss de TRAIN (no val_auc): corta si "
+                          "|loss_epoca - loss_epoca_anterior| < este valor (loss ya estancado). "
+                          "0.0 = desactivado. Independiente de --patience -- corta apenas se cumple "
+                          "CUALQUIERA de los dos criterios.")
     ap.add_argument("--bs", type=int, default=6)
     ap.add_argument("--accum", type=int, default=5)
     ap.add_argument("--lr", type=float, default=1e-4)
@@ -419,13 +501,22 @@ def main():
                           "bce = loss_bce_normal(), Binary Cross-Entropy de libro sobre P(hurto). "
                           "Las tres mantienen la misma cabeza de NUM_CLASES logits, retrocompatibles "
                           "con toda la inferencia existente.")
+    ap.add_argument("--resume", action="store_true",
+                     help="Retoma desde runs/<model>/resume_state.pt (pesos + optimizador + "
+                          "scheduler OneCycleLR + GradScaler + log), en vez de arrancar de cero. "
+                          "--epochs aca es SIEMPRE el TOTAL final de epocas de la corrida completa "
+                          "(no 'epocas de mas') -- el schedule de OneCycleLR se define una sola vez "
+                          "para todo el ciclo, asi que para que continuar sea equivalente a haber "
+                          "pedido esas epocas en una sola corrida, --model/--bs/--accum/--lr/--loss "
+                          "tienen que ser IDENTICOS a los de la corrida original (si no, se avisa "
+                          "pero se continua igual, ya sin garantia de equivalencia).")
     args = ap.parse_args()
 
     torch.manual_seed(0)
     random.seed(0)
     np.random.seed(0)
     device = "cuda"
-    run_dir = os.path.join(RUNS, args.model)
+    run_dir = os.path.join(RUNS, args.model + ("-scratch" if args.scratch else ""))
     os.makedirs(run_dir, exist_ok=True)
 
     items = load_index()
@@ -434,7 +525,7 @@ def main():
     n_pos_tr = sum(1 for i in tr if i["label"] == 1)
     print(f"train {len(tr)} (hurto {n_pos_tr}) | val {len(va)} (hurto {sum(1 for i in va if i['label']==1)})")
 
-    model, mean, std = build_model(args.model)
+    model, mean, std = build_model(args.model, scratch=args.scratch)
     model.to(device)
 
     ds_tr = TubeDataset(tr, True, mean, std)
@@ -468,16 +559,65 @@ def main():
     }[args.loss]
     print(f"[loss] {args.loss}", flush=True)
 
-    # Baseline sin entrenar, "ep": 0 -- mismo criterio que train.py, para
-    # poder comparar el salto real en las graficas despues.
-    log = []
-    print("evaluando modelo BASE (sin entrenar) para tener una referencia...", flush=True)
-    auc0, ap0, _, _ = evaluate(model, dl_va, device)
-    print(f"ep 0/{args.epochs} (BASELINE, sin entrenar)  val_auc {auc0:.4f}  val_ap {ap0:.4f}", flush=True)
-    log.append({"ep": 0, "loss": None, "val_auc": float(auc0), "val_ap": float(ap0), "min": 0.0})
-    json.dump(log, open(os.path.join(run_dir, "log.json"), "w"), indent=1)
+    resume_path = os.path.join(run_dir, "resume_state.pt")
+    if args.resume:
+        # Checkpoint COMPLETO (pesos + opt + sched + scaler + log), separado
+        # de best.pt/last.pt/ep*.pt (esos siguen siendo SOLO state_dict del
+        # modelo -- eval.py/inferencia los cargan asi, no hay que romper eso).
+        assert os.path.exists(resume_path), f"--resume pedido pero no existe {resume_path}"
+        ck = torch.load(resume_path, map_location=device, weights_only=False)
+        hp = ck["hparams"]
+        for k in ("model", "bs", "accum", "lr", "loss"):
+            v_actual = getattr(args, k)
+            if v_actual != hp[k]:
+                print(f"[resume] AVISO: --{k} actual ({v_actual}) != el de la corrida guardada "
+                      f"({hp[k]}) -- la continuacion YA NO es equivalente a una corrida unica.",
+                      flush=True)
+        if args.epochs != hp["epochs"]:
+            # sched.load_state_dict() de abajo pisa el total_steps con el que
+            # se construyo ESTA instancia -- el total original (hp["epochs"])
+            # es el que de verdad rige el annealing de OneCycleLR de aca en
+            # mas, sin importar que total_steps se haya usado para construir
+            # el objeto antes de cargarle el estado. Si --epochs pedido es
+            # MENOR al original, la corrida corta el ciclo sin terminar de
+            # bajar el LR (no revienta, pero ya no es "una corrida unica de
+            # --epochs"). Si es MAYOR, en algun momento sched.step() tira
+            # ValueError ("Tried to step X times...") al agotar los pasos
+            # que el ciclo original tenia programados.
+            print(f"[resume] AVISO: --epochs actual ({args.epochs}) != el total original de la "
+                  f"corrida guardada ({hp['epochs']}) -- el ciclo de OneCycleLR sigue regido por "
+                  f"el total ORIGINAL (se restaura via sched.load_state_dict), no por este numero. "
+                  f"Si pedis MAS del total original, en algun momento sched.step() va a tirar "
+                  f"ValueError al agotar los pasos programados.", flush=True)
+        if args.epochs <= ck["epoch"]:
+            raise SystemExit(f"--resume: --epochs ({args.epochs}) tiene que ser MAYOR a las epocas "
+                              f"ya completadas ({ck['epoch']}) -- --epochs es el TOTAL final de la "
+                              f"corrida completa, no 'epocas de mas'.")
+        model.load_state_dict(ck["model"])
+        opt.load_state_dict(ck["opt"])
+        sched.load_state_dict(ck["sched"])
+        scaler.load_state_dict(ck["scaler"])
+        log = ck["log"]
+        best_auc = ck["best_auc"]
+        epochs_sin_mejora = ck["epochs_sin_mejora"]
+        start_ep = ck["epoch"]
+        auc0 = log[0]["val_auc"]
+        print(f"[resume] retomado desde epoca {start_ep} (best_auc={best_auc:.4f}), "
+              f"corriendo hasta epoca {args.epochs}", flush=True)
+    else:
+        # Baseline sin entrenar, "ep": 0 -- mismo criterio que train.py, para
+        # poder comparar el salto real en las graficas despues.
+        log = []
+        print("evaluando modelo BASE (sin entrenar) para tener una referencia...", flush=True)
+        auc0, ap0, _, _ = evaluate(model, dl_va, device)
+        print(f"ep 0/{args.epochs} (BASELINE, sin entrenar)  val_auc {auc0:.4f}  val_ap {ap0:.4f}", flush=True)
+        log.append({"ep": 0, "loss": None, "val_auc": float(auc0), "val_ap": float(ap0), "min": 0.0})
+        json.dump(log, open(os.path.join(run_dir, "log.json"), "w"), indent=1)
+        best_auc = auc0
+        epochs_sin_mejora = 0
+        start_ep = 0
 
-    best_auc = auc0
+    prev_loss = next((e["loss"] for e in reversed(log) if e["loss"] is not None), None)
     n_batches = len(dl_tr)
     # Progreso EN VIVO dentro de la epoca (no solo al final de cada una) --
     # pedido explicito, datasets grandes (66k+ tubos) tardan minutos por
@@ -486,7 +626,7 @@ def main():
     # esto corre en background via nohup y se sigue con tail/grep sobre el
     # log, no en una TTY -- \r no se ve bien ahi.
     log_every = max(1, n_batches // 20)
-    for ep in range(args.epochs):
+    for ep in range(start_ep, args.epochs):
         model.train()
         t0, losses = time.time(), []
         opt.zero_grad(set_to_none=True)
@@ -516,11 +656,39 @@ def main():
         log.append({"ep": ep+1, "loss": float(np.mean(losses)),
                     "val_auc": float(auc), "val_ap": float(ap_), "min": dt/60})
         torch.save(model.state_dict(), os.path.join(run_dir, "last.pt"))
+        torch.save(model.state_dict(), os.path.join(run_dir, f"ep{ep+1}.pt"))
         if auc >= best_auc:
             best_auc = auc
+            epochs_sin_mejora = 0
             torch.save(model.state_dict(), os.path.join(run_dir, "best.pt"))
             print(f"  → best ({auc:.4f})", flush=True)
+        else:
+            epochs_sin_mejora += 1
         json.dump(log, open(os.path.join(run_dir, "log.json"), "w"), indent=1)
+        # Checkpoint de resume: TODO lo necesario para continuar de forma
+        # exacta (pesos + opt + sched + scaler), sobreescrito cada epoca --
+        # a diferencia de last.pt/ep*.pt (solo pesos), este no sirve para
+        # inferencia, solo para --resume.
+        torch.save({
+            "model": model.state_dict(), "opt": opt.state_dict(),
+            "sched": sched.state_dict(), "scaler": scaler.state_dict(),
+            "epoch": ep + 1, "best_auc": best_auc,
+            "epochs_sin_mejora": epochs_sin_mejora, "log": log,
+            "hparams": {"model": args.model, "bs": args.bs, "accum": args.accum,
+                        "lr": args.lr, "loss": args.loss, "epochs": args.epochs},
+        }, resume_path)
+        if args.patience > 0 and epochs_sin_mejora >= args.patience:
+            print(f"[early stop] val_auc sin mejorar en {args.patience} epocas seguidas, "
+                  f"cortando en ep {ep+1}/{args.epochs}", flush=True)
+            break
+        cur_loss = float(np.mean(losses))
+        if args.loss_delta_stop > 0 and prev_loss is not None:
+            delta = abs(cur_loss - prev_loss)
+            if delta < args.loss_delta_stop:
+                print(f"[early stop] loss estancado (|Δloss|={delta:.5f} < {args.loss_delta_stop}), "
+                      f"cortando en ep {ep+1}/{args.epochs}", flush=True)
+                break
+        prev_loss = cur_loss
 
     print(f"FIN {args.model}: baseline val_auc {auc0:.4f} -> best val_auc {best_auc:.4f}")
 
