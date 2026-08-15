@@ -34,7 +34,9 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 
-ROOT = "/media/mulinux/T5001/smartvcom2/CaptureVCOMv2-main/salida_offline/dataset_todo_binario"
+# Configurable via env var TRAIN_ROOT -- permite apuntar a otro dataset
+# (ej. una cosecha nueva en otra carpeta/maquina) sin tocar este archivo.
+ROOT = os.environ.get("TRAIN_ROOT", "/media/mulinux/T5001/smartvcom2/CaptureVCOMv2-main/salida_offline/dataset_todo_binario")
 RUNS = os.path.join(ROOT, "runs_aug")
 
 NUM_CLASES = 2
@@ -283,6 +285,22 @@ def _carga_videomae_bin_manual(mid, num_labels, num_frames=16):
 # asi el modelo resultante no tiene ninguna dependencia de un checkpoint
 # CC-BY-NC-4.0, se entrena 100% desde los datos propios.
 _VIDEOMAE_ARCH = {
+    # "videomae-tiny": diseno propio (no existe checkpoint oficial a este
+    # tamano -- SOLO usable con --scratch). Apunta a ~1/4 de los parametros
+    # de "small" (21.9M -> apunta a ~5M). hidden_size/num_hidden_layers=192/12
+    # replican EXACTO la config de DeiT-Tiny (Touvron et al. 2021,
+    # facebookresearch/deit) -- el ViT chico mas validado en la literatura,
+    # en vez de inventar numeros sueltos. La diferencia real respecto a
+    # copiar "small" a escala es num_attention_heads: "small" oficial de
+    # MCG-NJU usa 16 heads con hidden=384 (head_dim=384/16=24, angosto);
+    # aca con heads=3 se llega a head_dim=192/3=64 -- el estandar que SI usan
+    # base/large/huge de esta misma familia (768/12=64, 1024/16=64,
+    # 1280/16=80) y DeiT-Tiny. Confirmado a mano: el conteo de parametros de
+    # atencion NO depende de num_attention_heads (misma cantidad de pesos,
+    # solo cambia como se parte el tensor) -- head_dim=64 sale gratis, sin
+    # pagar mas parametros que con heads=16. intermediate_size=768=4*hidden,
+    # misma proporcion que el resto de la familia. Medido: 5.63M params.
+    "videomae-tiny": dict(hidden_size=192, num_hidden_layers=12, num_attention_heads=3, intermediate_size=768),
     "videomae-small": dict(hidden_size=384, num_hidden_layers=12, num_attention_heads=16, intermediate_size=1536),
     "videomae": dict(hidden_size=768, num_hidden_layers=12, num_attention_heads=12, intermediate_size=3072),
     "videomae-large": dict(hidden_size=1024, num_hidden_layers=24, num_attention_heads=16, intermediate_size=4096),
@@ -309,6 +327,9 @@ def build_model(name, scratch=False, frames=16):
         m = _build_videomae_scratch(name, NUM_CLASES, num_frames=frames)
         mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
         return _WrapVideoMAE(m), mean, std
+    if name == "videomae-tiny":
+        raise ValueError("videomae-tiny no tiene checkpoint preentrenado (arquitectura propia, "
+                          "no publicada por MCG-NJU) -- solo se puede usar con --scratch.")
     if name == "videomae":
         # num_frames: la position embedding (sinusoidal fija) se recalcula
         # SIEMPRE desde el config al construirse, nunca se carga del
@@ -352,6 +373,13 @@ def build_model(name, scratch=False, frames=16):
         cfg = VideoMAEConfig.from_pretrained(mid, num_labels=NUM_CLASES, num_frames=frames)
         m = VideoMAEForVideoClassification.from_pretrained(
             mid, config=cfg, ignore_mismatched_sizes=True)
+        # frames>16 (32): la secuencia de atencion se duplica, el pico de
+        # 11.4GB medido a 16 frames deja de ser confiable -- exactamente el
+        # caso que el comentario de arriba pide prender a mano. Gatea por
+        # frames, no siempre: a 16 frames entra holgado sin esto.
+        if frames > 16:
+            m.gradient_checkpointing_enable()
+            print(f"[modelo] {mid} -- frames={frames}>16, gradient checkpointing ON (VRAM)")
         print(f"[modelo] {mid} -- {sum(p.numel() for p in m.parameters())/1e6:.1f}M params, num_frames={frames}")
         mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
         return _WrapVideoMAE(m), mean, std
@@ -525,7 +553,7 @@ def evaluate(model, loader, device):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", choices=["videomae", "videomae-small", "videomae-large", "videomae-h",
+    ap.add_argument("--model", choices=["videomae-tiny", "videomae", "videomae-small", "videomae-large", "videomae-h",
                                          "mvit", "videomaev2", "videomaev2-large", "videomaev2-h"], required=True)
     ap.add_argument("--frames", type=int, default=16, choices=[16, 32],
                      help="Cantidad de frames por tubo que el modelo espera (solo familia "
@@ -541,7 +569,7 @@ def main():
                      help="Arma la arquitectura de --model (solo familia VideoMAE V1) con pesos random "
                           "(init estandar de transformers, sin from_pretrained) en vez de partir del "
                           "checkpoint preentrenado de MCG-NJU -- sin ninguna dependencia de su licencia "
-                          "CC-BY-NC-4.0, se entrena 100% desde el dataset propio. Los resultados se "
+                          "CC-BY-NC-4.0, se entrena 100%% desde el dataset propio. Los resultados se "
                           "guardan en runs/<model>-scratch/, NO pisa la corrida con checkpoint.")
     ap.add_argument("--epochs", type=int, default=15)
     ap.add_argument("--patience", type=int, default=3,
