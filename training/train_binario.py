@@ -247,6 +247,46 @@ class _WrapVideoMAE(nn.Module):
         return self.m(pixel_values=x.permute(0, 2, 1, 3, 4)).logits
 
 
+def _remapea_bias_atencion(m, mid):
+    """transformers>=5.x renombro las bias de atencion de VideoMAE (q_bias/
+    v_bias fusionadas -> query.bias/key.bias/value.bias separadas), pero los
+    checkpoints publicados por MCG-NJU siguen en el formato viejo --
+    confirmado en vivo: from_pretrained(...) descarta q_bias/v_bias como
+    "UNEXPECTED" en el LOAD REPORT y deja query.bias/key.bias/value.bias con
+    la init random de VideoMAEForVideoClassification(cfg). Los pesos
+    principales (query/key/value.WEIGHT) SI cargan bien -- sin este fix
+    "pesos preentrenados" es verdad a medias: las bias de atencion de las
+    12/24 capas quedan sin entrenar en silencio, sin ningun error.
+
+    key.bias no existe en el checkpoint original (VideoMAE solo tiene bias
+    aprendible en q y v, diseño heredado de BEiT) -- se deja en cero, igual
+    que el propio formato viejo de transformers asumia implicitamente."""
+    from huggingface_hub import hf_hub_download
+    from safetensors.torch import load_file
+    try:
+        path = hf_hub_download(mid, "model.safetensors")
+        raw = load_file(path)
+    except Exception:
+        path = hf_hub_download(mid, "pytorch_model.bin")
+        raw = torch.load(path, map_location="cpu", weights_only=True)
+
+    remap = {}
+    for k, v in raw.items():
+        if k.endswith("attention.attention.q_bias"):
+            remap[k[: -len("q_bias")] + "query.bias"] = v
+        elif k.endswith("attention.attention.v_bias"):
+            prefix = k[: -len("v_bias")]
+            remap[prefix + "value.bias"] = v
+            remap[prefix + "key.bias"] = torch.zeros_like(v)
+    if not remap:
+        return  # este checkpoint ya viene en el formato nuevo, nada que remapear
+
+    _missing, unexpected = m.load_state_dict(remap, strict=False)
+    assert not unexpected, f"remap de bias de atencion produjo keys inesperadas: {unexpected}"
+    print(f"[modelo] {mid} -- remapeadas {len(remap)} bias de atencion "
+          f"(formato viejo del checkpoint -> formato nuevo de transformers>=5.x)")
+
+
 def _carga_videomae_bin_manual(mid, num_labels, num_frames=16):
     """Bypass del bloqueo de transformers a torch.load para checkpoints que
     SOLO traen pytorch_model.bin (no model.safetensors) -- caso real:
@@ -342,6 +382,7 @@ def build_model(name, scratch=False, frames=16):
         cfg = VideoMAEConfig.from_pretrained(mid, num_labels=NUM_CLASES, num_frames=frames)
         m = VideoMAEForVideoClassification.from_pretrained(
             mid, config=cfg, ignore_mismatched_sizes=True)
+        _remapea_bias_atencion(m, mid)
         print(f"[modelo] {mid} -- num_frames={frames}")
         mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
         return _WrapVideoMAE(m), mean, std
@@ -373,6 +414,7 @@ def build_model(name, scratch=False, frames=16):
         cfg = VideoMAEConfig.from_pretrained(mid, num_labels=NUM_CLASES, num_frames=frames)
         m = VideoMAEForVideoClassification.from_pretrained(
             mid, config=cfg, ignore_mismatched_sizes=True)
+        _remapea_bias_atencion(m, mid)
         # frames>16 (32): la secuencia de atencion se duplica, el pico de
         # 11.4GB medido a 16 frames deja de ser confiable -- exactamente el
         # caso que el comentario de arriba pide prender a mano. Gatea por
