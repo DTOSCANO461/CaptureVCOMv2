@@ -19,8 +19,11 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 
-ROOT = "/home/tomis/SBT/DATASETS"
-RUNS = os.path.join(ROOT, "train", "runs")
+# Configurable via env var TRAIN_ROOT -- mismo patron que train_binario.py
+# (ver ese archivo para el detalle) -- permite apuntar a otro dataset sin
+# tocar el codigo.
+ROOT = os.environ.get("TRAIN_ROOT", "/home/tomis/SBT/DATASETS")
+RUNS = os.path.join(ROOT, "runs_multiclase")
 
 # Multiclase: hasta 70 acciones (0-69; 69 es DEFAULT_ACCION en
 # labeling_strategy.py, el placeholder de "no se pudo resolver un label
@@ -222,18 +225,83 @@ class _WrapVideoMAE(nn.Module):
         return self.m(pixel_values=x.permute(0, 2, 1, 3, 4)).logits
 
 
-def _carga_videomae_bin_manual(mid, num_labels):
+def _formato_bias_nuevo(claves):
+    """Ver docstring identico en train_binario.py -- True si `claves` usa el
+    formato NUEVO de bias de atencion (query.bias/key.bias/value.bias,
+    transformers>=5.x) en vez del viejo (q_bias/v_bias, el que publica
+    MCG-NJU en todos sus checkpoints)."""
+    return any(str(k).endswith("attention.attention.query.bias") for k in claves)
+
+
+def _remapea_sd_a_formato_nuevo(sd):
+    """Ver docstring identico en train_binario.py -- sd viene SIEMPRE en el
+    formato viejo (asi lo publica MCG-NJU); devuelve una copia remapeada al
+    formato nuevo (key.bias en cero, no existe en el checkpoint original)."""
+    nuevo = {}
+    for k, v in sd.items():
+        if k.endswith("attention.attention.q_bias"):
+            nuevo[k[: -len("q_bias")] + "query.bias"] = v
+        elif k.endswith("attention.attention.v_bias"):
+            prefix = k[: -len("v_bias")]
+            nuevo[prefix + "value.bias"] = v
+            nuevo[prefix + "key.bias"] = torch.zeros_like(v)
+        else:
+            nuevo[k] = v
+    return nuevo
+
+
+def _remapea_bias_atencion(m, mid):
+    """Ver docstring identico en train_binario.py::_remapea_bias_atencion
+    para el detalle completo del problema (transformers>=5.x separo q_bias/
+    v_bias en query.bias/key.bias/value.bias, from_pretrained descarta las
+    del checkpoint como "unexpected" y deja las nuevas sin entrenar en
+    silencio)."""
+    from huggingface_hub import hf_hub_download
+    from safetensors.torch import load_file
+    try:
+        path = hf_hub_download(mid, "model.safetensors")
+        raw = load_file(path)
+    except Exception:
+        path = hf_hub_download(mid, "pytorch_model.bin")
+        raw = torch.load(path, map_location="cpu", weights_only=True)
+
+    claves_modelo = set(m.state_dict().keys())
+    if not _formato_bias_nuevo(claves_modelo):
+        return  # este entorno usa transformers<5.x (formato viejo, nativo) -- ya cargo bien solo
+
+    raw_nuevo = _remapea_sd_a_formato_nuevo(raw)
+    remap = {k: v for k, v in raw_nuevo.items()
+             if k.endswith(("attention.attention.query.bias", "attention.attention.key.bias",
+                             "attention.attention.value.bias")) and k in claves_modelo}
+    if not remap:
+        return
+
+    _missing, unexpected = m.load_state_dict(remap, strict=False)
+    assert not unexpected, f"remap de bias de atencion produjo keys inesperadas: {unexpected}"
+    print(f"[modelo] {mid} -- remapeadas {len(remap)} bias de atencion "
+          f"(formato viejo del checkpoint -> formato nuevo de transformers>=5.x)")
+
+
+def _carga_videomae_bin_manual(mid, num_labels, num_frames=16):
     """Ver docstring identico en train_binario.py::build_model() -- bypass
     del bloqueo de transformers a torch.load para checkpoints que SOLO
     traen pytorch_model.bin (caso: MCG-NJU/videomae-small-finetuned-kinetics),
     exige torch>=2.6 aun con weights_only=True (tenemos 2.5.1). weights_only=True
-    ya es la parte segura (evita ejecucion de codigo via pickle)."""
+    ya es la parte segura (evita ejecucion de codigo via pickle). Adapta el
+    sd al formato de bias que espere el modelo ANTES de cargarlo (mismo fix
+    que train_binario.py -- sin esto, "videomae-h" bajo transformers>=5.x
+    crashea con missing inesperado)."""
     from huggingface_hub import hf_hub_download
     from transformers import VideoMAEConfig, VideoMAEForVideoClassification
     path = hf_hub_download(mid, "pytorch_model.bin")
     sd = torch.load(path, map_location="cpu", weights_only=True)
-    cfg = VideoMAEConfig.from_pretrained(mid, num_labels=num_labels)
+    cfg = VideoMAEConfig.from_pretrained(mid, num_labels=num_labels, num_frames=num_frames)
     m = VideoMAEForVideoClassification(cfg)
+
+    if _formato_bias_nuevo(m.state_dict().keys()):
+        sd = _remapea_sd_a_formato_nuevo(sd)
+        print(f"[modelo] {mid} -- state_dict adaptado a formato nuevo de bias (transformers>=5.x)")
+
     sd.pop("classifier.weight", None)
     sd.pop("classifier.bias", None)
     missing, unexpected = m.load_state_dict(sd, strict=False)
@@ -242,13 +310,15 @@ def _carga_videomae_bin_manual(mid, num_labels):
     return m
 
 
-def build_model(name):
+def build_model(name, frames=16):
     if name == "videomae":
-        from transformers import VideoMAEForVideoClassification
+        from transformers import VideoMAEConfig, VideoMAEForVideoClassification
         mid = "MCG-NJU/videomae-base-finetuned-kinetics"
+        cfg = VideoMAEConfig.from_pretrained(mid, num_labels=NUM_CLASES, num_frames=frames)
         m = VideoMAEForVideoClassification.from_pretrained(
-            mid, num_labels=NUM_CLASES, ignore_mismatched_sizes=True)
-        print(f"[modelo] {mid}")
+            mid, config=cfg, ignore_mismatched_sizes=True)
+        _remapea_bias_atencion(m, mid)
+        print(f"[modelo] {mid} -- num_frames={frames}")
         mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
         return _WrapVideoMAE(m), mean, std
     elif name == "videomae-small":
@@ -258,19 +328,23 @@ def build_model(name):
         # base, nunca small de verdad; ademas ese repo solo trae
         # pytorch_model.bin, ver _carga_videomae_bin_manual()).
         mid = "MCG-NJU/videomae-small-finetuned-kinetics"
-        m = _carga_videomae_bin_manual(mid, NUM_CLASES)
-        print(f"[modelo] {mid} -- {sum(p.numel() for p in m.parameters())/1e6:.1f}M params")
+        m = _carga_videomae_bin_manual(mid, NUM_CLASES, num_frames=frames)
+        print(f"[modelo] {mid} -- {sum(p.numel() for p in m.parameters())/1e6:.1f}M params, num_frames={frames}")
         mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
         return _WrapVideoMAE(m), mean, std
     elif name == "videomae-large":
         # Ver comentario identico en train_binario.py::build_model() --
         # 304M params, trae model.safetensors (sin workaround), probado sin
         # gradient checkpointing con bs=6, pico real 11.4GB de VRAM.
-        from transformers import VideoMAEForVideoClassification
+        from transformers import VideoMAEConfig, VideoMAEForVideoClassification
         mid = "MCG-NJU/videomae-large-finetuned-kinetics"
+        cfg = VideoMAEConfig.from_pretrained(mid, num_labels=NUM_CLASES, num_frames=frames)
         m = VideoMAEForVideoClassification.from_pretrained(
-            mid, num_labels=NUM_CLASES, ignore_mismatched_sizes=True)
-        print(f"[modelo] {mid} -- {sum(p.numel() for p in m.parameters())/1e6:.1f}M params")
+            mid, config=cfg, ignore_mismatched_sizes=True)
+        _remapea_bias_atencion(m, mid)
+        if frames > 16:
+            m.gradient_checkpointing_enable()
+        print(f"[modelo] {mid} -- {sum(p.numel() for p in m.parameters())/1e6:.1f}M params, num_frames={frames}")
         mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
         return _WrapVideoMAE(m), mean, std
     elif name == "mvit":
@@ -340,13 +414,18 @@ def main():
     ap.add_argument("--accum", type=int, default=5)
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--workers", type=int, default=5)
+    ap.add_argument("--frames", type=int, default=16, choices=[16, 32],
+                     help="cantidad de frames que ve el modelo (los tubos son de 32, se resamplean si hace falta)")
+    ap.add_argument("--boost-clase4", type=float, default=1.0,
+                     help="multiplicador extra sobre el peso del sampler para label==4 (robo), "
+                          "encima del balanceo por frecuencia inversa que ya hace parejo a todas las clases")
     args = ap.parse_args()
 
     torch.manual_seed(0)
     random.seed(0)
     np.random.seed(0)
     device = "cuda"
-    run_dir = os.path.join(RUNS, args.model)
+    run_dir = os.path.join(RUNS, f"{args.model}_{args.frames}f")
     os.makedirs(run_dir, exist_ok=True)
 
     items = load_index()
@@ -355,20 +434,24 @@ def main():
     n_clases_tr = len(set(i["label"] for i in tr))
     print(f"train {len(tr)} ({n_clases_tr} clases distintas) | val {len(va)}")
 
-    model, mean, std = build_model(args.model)
+    model, mean, std = build_model(args.model, frames=args.frames)
     model.to(device)
 
-    ds_tr = TubeDataset(tr, True, mean, std)
-    ds_va = TubeDataset(va, False, mean, std)
+    ds_tr = TubeDataset(tr, True, mean, std, n_frames=args.frames)
+    ds_va = TubeDataset(va, False, mean, std, n_frames=args.frames)
     # sampler balanceado POR CLASE (antes binario hurto/normal): peso
     # inversamente proporcional al conteo de esa clase en train, asi las
     # clases chicas (algunas con 1-2 tubos en una muestra de 500) no quedan
     # invisibles frente a las grandes (ej. label 48, que junta control_negativo
-    # Y doblar_sobreponer Y varios "no_obvio").
+    # Y doblar_sobreponer Y varios "no_obvio"). Encima de eso, --boost-clase4
+    # multiplica el peso de label==4 (robo) para que el modelo la vea mas
+    # seguido que "parejo" -- pedido explicito del usuario (preentrenamiento
+    # multiclase pensado como paso previo al binario, interesa mas robo que
+    # el resto de las acciones).
     conteo_clase = {}
     for i in tr:
         conteo_clase[i["label"]] = conteo_clase.get(i["label"], 0) + 1
-    wts = [1.0 / conteo_clase[i["label"]] for i in tr]
+    wts = [(1.0 / conteo_clase[i["label"]]) * (args.boost_clase4 if i["label"] == 4 else 1.0) for i in tr]
     sampler = WeightedRandomSampler(wts, num_samples=len(tr), replacement=True)
     dl_tr = DataLoader(ds_tr, batch_size=args.bs, sampler=sampler,
                        num_workers=args.workers, pin_memory=True, drop_last=True,
