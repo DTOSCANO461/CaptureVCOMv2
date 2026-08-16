@@ -675,6 +675,18 @@ def main():
                           "bce = loss_bce_normal(), Binary Cross-Entropy de libro sobre P(hurto). "
                           "Las tres mantienen la misma cabeza de NUM_CLASES logits, retrocompatibles "
                           "con toda la inferencia existente.")
+    ap.add_argument("--init-checkpoint", default=None,
+                     help="En vez de partir del checkpoint preentrenado de MCG-NJU (Kinetics), carga "
+                          "los pesos de un .pt guardado por este mismo script o por train.py (mismo "
+                          "formato, _WrapVideoMAE con prefijo 'm.') -- pensado para el experimento de "
+                          "preentrenar en multiclase (train.py, cabeza de 70) y despues afinar en "
+                          "binario: la cabeza (m.classifier.weight/bias) se descarta por desajuste de "
+                          "shape (70 vs 2) y se reinicializa random, el resto del backbone se carga tal "
+                          "cual. Independiente de --scratch (no tiene sentido combinarlos).")
+    ap.add_argument("--tag", default="",
+                     help="Sufijo libre para el nombre del run_dir (ej. --tag ft-lr-bajo), para no pisar "
+                          "otras corridas del mismo --model/--frames (ej. las 2 variantes de fine-tune "
+                          "multiclase->binario, LR bajo vs full).")
     ap.add_argument("--resume", action="store_true",
                      help="Retoma desde runs/<model>/resume_state.pt (pesos + optimizador + "
                           "scheduler OneCycleLR + GradScaler + log), en vez de arrancar de cero. "
@@ -696,7 +708,8 @@ def main():
     # confirmado en vivo (large-32f sobreescribiendo el run_dir de large-16f
     # mientras corria, tuvieron que rescatarse best.pt/last.pt a mano antes
     # de que la nueva corrida llegara a su propio primer save).
-    run_dir = os.path.join(RUNS, args.model + ("-scratch" if args.scratch else "") + f"_{args.frames}f")
+    run_dir = os.path.join(RUNS, args.model + ("-scratch" if args.scratch else "") + f"_{args.frames}f"
+                            + (f"_{args.tag}" if args.tag else ""))
     os.makedirs(run_dir, exist_ok=True)
 
     items = load_index()
@@ -706,6 +719,17 @@ def main():
     print(f"train {len(tr)} (hurto {n_pos_tr}) | val {len(va)} (hurto {sum(1 for i in va if i['label']==1)})")
 
     model, mean, std = build_model(args.model, scratch=args.scratch, frames=args.frames)
+
+    if args.init_checkpoint:
+        sd = torch.load(args.init_checkpoint, map_location="cpu", weights_only=True)
+        sd.pop("m.classifier.weight", None)
+        sd.pop("m.classifier.bias", None)
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        assert set(missing) <= {"m.classifier.weight", "m.classifier.bias"}, f"missing inesperado: {missing}"
+        assert not unexpected, f"unexpected: {unexpected}"
+        print(f"[init-checkpoint] {args.init_checkpoint} -- backbone cargado, "
+              f"cabeza (m.classifier.*) reinicializada random (desajuste de shape esperado)")
+
     model.to(device)
 
     ds_tr = TubeDataset(tr, True, mean, std, n_frames=args.frames)
