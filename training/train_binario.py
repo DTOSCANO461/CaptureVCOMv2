@@ -271,21 +271,13 @@ def _remapea_bias_atencion(m, mid):
         raw = torch.load(path, map_location="cpu", weights_only=True)
 
     claves_modelo = set(m.state_dict().keys())
-    if "videomae.encoder.layer.0.attention.attention.q_bias" in claves_modelo:
+    if not _formato_bias_nuevo(claves_modelo):
         return  # este entorno usa transformers<5.x (formato viejo, nativo) -- ya cargo bien solo, nada que remapear
 
-    remap = {}
-    for k, v in raw.items():
-        if k.endswith("attention.attention.q_bias"):
-            remap[k[: -len("q_bias")] + "query.bias"] = v
-        elif k.endswith("attention.attention.v_bias"):
-            prefix = k[: -len("v_bias")]
-            remap[prefix + "value.bias"] = v
-            remap[prefix + "key.bias"] = torch.zeros_like(v)
-    if not remap:
-        return  # este checkpoint ya viene en el formato nuevo, nada que remapear
-
-    remap = {k: v for k, v in remap.items() if k in claves_modelo}
+    raw_nuevo = _remapea_sd_a_formato_nuevo(raw)
+    remap = {k: v for k, v in raw_nuevo.items()
+             if k.endswith(("attention.attention.query.bias", "attention.attention.key.bias",
+                             "attention.attention.value.bias")) and k in claves_modelo}
     if not remap:
         return  # nombres de capa no coinciden con lo esperado -- no tocar nada en vez de arriesgar un mal remap
 
@@ -295,18 +287,54 @@ def _remapea_bias_atencion(m, mid):
           f"(formato viejo del checkpoint -> formato nuevo de transformers>=5.x)")
 
 
+def _formato_bias_nuevo(claves):
+    """True si `claves` (state_dict().keys() de un modelo VideoMAEv1 recien
+    construido) usa el formato NUEVO de bias de atencion (query.bias/
+    key.bias/value.bias, transformers>=5.x) en vez del viejo (q_bias/v_bias,
+    el que publica MCG-NJU en todos sus checkpoints)."""
+    return any(str(k).endswith("attention.attention.query.bias") for k in claves)
+
+
+def _remapea_sd_a_formato_nuevo(sd):
+    """sd viene SIEMPRE en el formato viejo (asi lo publica MCG-NJU, sin
+    importar la version de transformers instalada en esta maquina) --
+    devuelve una copia remapeada al formato nuevo (query.bias/key.bias/
+    value.bias; key.bias en cero, no existe en el checkpoint original, ver
+    _remapea_bias_atencion)."""
+    nuevo = {}
+    for k, v in sd.items():
+        if k.endswith("attention.attention.q_bias"):
+            nuevo[k[: -len("q_bias")] + "query.bias"] = v
+        elif k.endswith("attention.attention.v_bias"):
+            prefix = k[: -len("v_bias")]
+            nuevo[prefix + "value.bias"] = v
+            nuevo[prefix + "key.bias"] = torch.zeros_like(v)
+        else:
+            nuevo[k] = v
+    return nuevo
+
+
 def _carga_videomae_bin_manual(mid, num_labels, num_frames=16):
     """Bypass del bloqueo de transformers a torch.load para checkpoints que
     SOLO traen pytorch_model.bin (no model.safetensors) -- caso real:
-    MCG-NJU/videomae-small-finetuned-kinetics. transformers>=4.5x exige
-    torch>=2.6 para permitir cargar .bin via torch.load, aun con
-    weights_only=True (bloqueo generico por CVE-2025-32434); aca tenemos
-    torch 2.5.1. weights_only=True YA es la parte segura de torch.load (evita
-    ejecucion de codigo arbitrario via pickle, que es la vulnerabilidad real)
-    -- se construye el modelo desde el config y se le carga el state_dict a
-    mano, sin pasar por el bloqueo (probado: 186 tensores, sin missing/
-    unexpected mas alla de la cabeza classifier.*, que se descarta a proposito
-    porque NUM_CLASES es distinto al checkpoint original)."""
+    MCG-NJU/videomae-small-finetuned-kinetics y -huge-finetuned-kinetics.
+    transformers>=4.5x exige torch>=2.6 para permitir cargar .bin via
+    torch.load, aun con weights_only=True (bloqueo generico por
+    CVE-2025-32434); weights_only=True YA es la parte segura de torch.load
+    (evita ejecucion de codigo arbitrario via pickle, que es la
+    vulnerabilidad real) -- se construye el modelo desde el config y se le
+    carga el state_dict a mano, sin pasar por el bloqueo.
+
+    Mismo problema que _remapea_bias_atencion (ver docstring): en un entorno
+    con transformers>=5.x el modelo recien construido espera
+    query.bias/key.bias/value.bias, pero pytorch_model.bin siempre trae
+    q_bias/v_bias (formato viejo) -- sin adaptar el sd ANTES de
+    load_state_dict, el assert de mas abajo fallaba con missing inesperado
+    (confirmado en vivo con "videomae-h" en un entorno transformers 5.14.1).
+    Se detecta el formato que el modelo espera y se adapta el sd completo
+    antes de cargar, en vez de cargar y remapear despues (a diferencia de
+    _remapea_bias_atencion, aca no hay from_pretrained que cargue el resto
+    primero -- es un solo load_state_dict de todo)."""
     from huggingface_hub import hf_hub_download
     from transformers import VideoMAEConfig, VideoMAEForVideoClassification
     path = hf_hub_download(mid, "pytorch_model.bin")
@@ -316,6 +344,11 @@ def _carga_videomae_bin_manual(mid, num_labels, num_frames=16):
     # -- pedir un num_frames distinto al del checkpoint no rompe el load_state_dict de abajo.
     cfg = VideoMAEConfig.from_pretrained(mid, num_labels=num_labels, num_frames=num_frames)
     m = VideoMAEForVideoClassification(cfg)
+
+    if _formato_bias_nuevo(m.state_dict().keys()):
+        sd = _remapea_sd_a_formato_nuevo(sd)
+        print(f"[modelo] {mid} -- state_dict adaptado a formato nuevo de bias (transformers>=5.x)")
+
     sd.pop("classifier.weight", None)
     sd.pop("classifier.bias", None)
     missing, unexpected = m.load_state_dict(sd, strict=False)
