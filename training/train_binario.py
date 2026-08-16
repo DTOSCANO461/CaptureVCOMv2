@@ -690,7 +690,13 @@ def main():
     random.seed(0)
     np.random.seed(0)
     device = "cuda"
-    run_dir = os.path.join(RUNS, args.model + ("-scratch" if args.scratch else ""))
+    # frames en el nombre del run_dir: sin esto, correr el mismo --model a
+    # 16f y despues a 32f (ej. "large 16f" -> "large 32f", "huge 16f" ->
+    # "huge 32f") pisa los checkpoints de la corrida anterior en silencio --
+    # confirmado en vivo (large-32f sobreescribiendo el run_dir de large-16f
+    # mientras corria, tuvieron que rescatarse best.pt/last.pt a mano antes
+    # de que la nueva corrida llegara a su propio primer save).
+    run_dir = os.path.join(RUNS, args.model + ("-scratch" if args.scratch else "") + f"_{args.frames}f")
     os.makedirs(run_dir, exist_ok=True)
 
     items = load_index()
