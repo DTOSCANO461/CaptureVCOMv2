@@ -270,6 +270,10 @@ def _remapea_bias_atencion(m, mid):
         path = hf_hub_download(mid, "pytorch_model.bin")
         raw = torch.load(path, map_location="cpu", weights_only=True)
 
+    claves_modelo = set(m.state_dict().keys())
+    if "videomae.encoder.layer.0.attention.attention.q_bias" in claves_modelo:
+        return  # este entorno usa transformers<5.x (formato viejo, nativo) -- ya cargo bien solo, nada que remapear
+
     remap = {}
     for k, v in raw.items():
         if k.endswith("attention.attention.q_bias"):
@@ -280,6 +284,10 @@ def _remapea_bias_atencion(m, mid):
             remap[prefix + "key.bias"] = torch.zeros_like(v)
     if not remap:
         return  # este checkpoint ya viene en el formato nuevo, nada que remapear
+
+    remap = {k: v for k, v in remap.items() if k in claves_modelo}
+    if not remap:
+        return  # nombres de capa no coinciden con lo esperado -- no tocar nada en vez de arriesgar un mal remap
 
     _missing, unexpected = m.load_state_dict(remap, strict=False)
     assert not unexpected, f"remap de bias de atencion produjo keys inesperadas: {unexpected}"
