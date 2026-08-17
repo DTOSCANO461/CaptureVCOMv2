@@ -439,7 +439,7 @@ def _build_videomae_scratch(name, num_labels, num_frames=16):
     return m
 
 
-def build_model(name, scratch=False, frames=16):
+def build_model(name, scratch=False, frames=16, no_grad_checkpoint=False):
     if scratch:
         assert name in _VIDEOMAE_ARCH, (
             f"--scratch solo soportado para {list(_VIDEOMAE_ARCH)} (familia VideoMAE V1) por ahora")
@@ -498,9 +498,12 @@ def build_model(name, scratch=False, frames=16):
         # 11.4GB medido a 16 frames deja de ser confiable -- exactamente el
         # caso que el comentario de arriba pide prender a mano. Gatea por
         # frames, no siempre: a 16 frames entra holgado sin esto.
-        if frames > 16:
+        if frames > 16 and not no_grad_checkpoint:
             m.gradient_checkpointing_enable()
             print(f"[modelo] {mid} -- frames={frames}>16, gradient checkpointing ON (VRAM)")
+        elif frames > 16 and no_grad_checkpoint:
+            print(f"[modelo] {mid} -- frames={frames}>16 pero --no-grad-checkpoint pedido, "
+                  f"gradient checkpointing OFF (mas VRAM, mas rapido si entra)")
         print(f"[modelo] {mid} -- {sum(p.numel() for p in m.parameters())/1e6:.1f}M params, num_frames={frames}")
         mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
         return _WrapVideoMAE(m), mean, std
@@ -692,6 +695,11 @@ def main():
                           "checkpoint preentrenado de MCG-NJU -- sin ninguna dependencia de su licencia "
                           "CC-BY-NC-4.0, se entrena 100%% desde el dataset propio. Los resultados se "
                           "guardan en runs/<model>-scratch/, NO pisa la corrida con checkpoint.")
+    ap.add_argument("--no-grad-checkpoint", action="store_true",
+                     help="Fuerza a desactivar gradient checkpointing aunque --model/--frames lo "
+                          "activarian por default (ej. videomae-large a 32f) -- para probar si el "
+                          "modelo entra en VRAM sin el, mas rapido por epoca al no recalcular "
+                          "activaciones en el backward. Si no entra, tira CUDA OutOfMemoryError.")
     ap.add_argument("--epochs", type=int, default=15)
     ap.add_argument("--patience", type=int, default=3,
                      help="Early stopping: corta el entrenamiento si val_auc no mejora (respecto al "
@@ -783,7 +791,8 @@ def main():
     n_pos_tr = sum(1 for i in tr if i["label"] == 1)
     print(f"train {len(tr)} (hurto {n_pos_tr}) | val {len(va)} (hurto {sum(1 for i in va if i['label']==1)})")
 
-    model, mean, std = build_model(args.model, scratch=args.scratch, frames=args.frames)
+    model, mean, std = build_model(args.model, scratch=args.scratch, frames=args.frames,
+                                    no_grad_checkpoint=args.no_grad_checkpoint)
 
     if args.init_checkpoint:
         sd = torch.load(args.init_checkpoint, map_location="cpu", weights_only=True)
