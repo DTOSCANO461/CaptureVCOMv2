@@ -852,21 +852,15 @@ def main():
                       f"({hp[k]}) -- la continuacion YA NO es equivalente a una corrida unica.",
                       flush=True)
         if args.epochs != hp["epochs"]:
-            # sched.load_state_dict() de abajo pisa el total_steps con el que
-            # se construyo ESTA instancia -- el total original (hp["epochs"])
-            # es el que de verdad rige el annealing de OneCycleLR de aca en
-            # mas, sin importar que total_steps se haya usado para construir
-            # el objeto antes de cargarle el estado. Si --epochs pedido es
-            # MENOR al original, la corrida corta el ciclo sin terminar de
-            # bajar el LR (no revienta, pero ya no es "una corrida unica de
-            # --epochs"). Si es MAYOR, en algun momento sched.step() tira
-            # ValueError ("Tried to step X times...") al agotar los pasos
-            # que el ciclo original tenia programados.
+            # Si --epochs pedido es MENOR al original, el ciclo de OneCycleLR
+            # se restaura tal cual (sched.load_state_dict) y corta sin
+            # terminar de bajar el LR -- no revienta, pero ya no es "una
+            # corrida unica de --epochs". Si es MAYOR (extender una corrida
+            # ya terminada), mas abajo se reconstruye un OneCycleLR nuevo
+            # dimensionado para lo que falta, en vez de reusar el original
+            # (que ya no tiene pasos programados para eso).
             print(f"[resume] AVISO: --epochs actual ({args.epochs}) != el total original de la "
-                  f"corrida guardada ({hp['epochs']}) -- el ciclo de OneCycleLR sigue regido por "
-                  f"el total ORIGINAL (se restaura via sched.load_state_dict), no por este numero. "
-                  f"Si pedis MAS del total original, en algun momento sched.step() va a tirar "
-                  f"ValueError al agotar los pasos programados.", flush=True)
+                  f"corrida guardada ({hp['epochs']}).", flush=True)
         if args.epochs <= ck["epoch"]:
             raise SystemExit(f"--resume: --epochs ({args.epochs}) tiene que ser MAYOR a las epocas "
                               f"ya completadas ({ck['epoch']}) -- --epochs es el TOTAL final de la "
@@ -888,14 +882,30 @@ def main():
         sd_resume = _adapta_sd_al_entorno(ck["model"], model, etiqueta="resume")
         model.load_state_dict(sd_resume)
         start_ep = ck["epoch"]
-        if cruza_entorno:
+        # El ciclo de OneCycleLR original solo tiene pasos programados para
+        # hp["epochs"] -- pedir MAS que eso (ej. extender una corrida ya
+        # terminada de 20 a 30) agota esos pasos y sched.step() tira
+        # ValueError apenas se completan. Mismo problema de fondo que el
+        # cruce de entorno (el schedule guardado ya no sirve tal cual), asi
+        # que se resuelve igual: reconstruir un OneCycleLR nuevo dimensionado
+        # para lo que falta. El optimizador (momentum de Adam) SI se puede
+        # seguir usando en este caso (no cambian shapes de parametros, solo
+        # el total de pasos), asi que se carga igual salvo que cruce entorno.
+        pide_mas_epocas = args.epochs > hp["epochs"]
+        if cruza_entorno or pide_mas_epocas:
             epochs_restantes = args.epochs - start_ep
             total_steps_restante = max(steps_ep * epochs_restantes, 20)
             sched = torch.optim.lr_scheduler.OneCycleLR(
                 opt, max_lr=args.lr, total_steps=total_steps_restante, pct_start=0.1)
-            print(f"[resume] CRUCE DE ENTORNO detectado (formato de bias distinto) -- pesos "
-                  f"cargados, pero optimizador/scheduler arrancan de cero (OneCycleLR nuevo para "
-                  f"las {epochs_restantes} epocas restantes). No es un resume identico.", flush=True)
+            if cruza_entorno:
+                print(f"[resume] CRUCE DE ENTORNO detectado (formato de bias distinto) -- pesos "
+                      f"cargados, optimizador/scheduler arrancan de cero (OneCycleLR nuevo para "
+                      f"las {epochs_restantes} epocas restantes). No es un resume identico.", flush=True)
+            else:
+                opt.load_state_dict(ck["opt"])
+                print(f"[resume] extendiendo mas alla del total original ({hp['epochs']} -> "
+                      f"{args.epochs}) -- optimizador conservado, scheduler OneCycleLR nuevo "
+                      f"dimensionado para las {epochs_restantes} epocas restantes.", flush=True)
         else:
             opt.load_state_dict(ck["opt"])
             sched.load_state_dict(ck["sched"])
