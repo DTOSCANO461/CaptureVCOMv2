@@ -435,6 +435,14 @@ def main():
         print(f"[run_dir] --tag no especificado, generando uno por fecha/hora: {tag}", flush=True)
     run_dir = os.path.join(RUNS, f"{args.model}_{args.frames}f_{tag}")
     os.makedirs(run_dir, exist_ok=True)
+    run_name = os.path.basename(run_dir)
+    with open(os.path.join(run_dir, "meta.json"), "w") as f:
+        json.dump({
+            "run_name": run_name, "model": args.model, "frames": args.frames, "tag": tag,
+            "hparams": {"bs": args.bs, "accum": args.accum, "lr": args.lr,
+                        "boost_clase4": args.boost_clase4},
+            "creado": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }, f, indent=1)
 
     items = load_index()
     tr = [i for i in items if i["split"] == "train"]
@@ -490,7 +498,7 @@ def main():
     print("evaluando modelo BASE (sin entrenar) para tener una referencia...", flush=True)
     acc0, f1_0, _, _, _ = evaluate(model, dl_va, device)
     print(f"ep 0/{args.epochs} (BASELINE, sin entrenar)  val_acc {acc0:.4f}  val_f1 {f1_0:.4f}", flush=True)
-    log.append({"ep": 0, "loss": None, "val_acc": float(acc0), "val_f1": float(f1_0), "min": 0.0})
+    log.append({"ep": 0, "run": run_name, "loss": None, "val_acc": float(acc0), "val_f1": float(f1_0), "min": 0.0})
     json.dump(log, open(os.path.join(run_dir, "log.json"), "w"), indent=1)
 
     best_f1 = f1_0
@@ -514,7 +522,7 @@ def main():
         dt = time.time() - t0
         print(f"ep {ep+1}/{args.epochs} loss {np.mean(losses):.4f} "
               f"val_acc {acc:.4f} val_f1 {f1:.4f} ({dt/60:.1f} min)", flush=True)
-        log.append({"ep": ep+1, "loss": float(np.mean(losses)),
+        log.append({"ep": ep+1, "run": run_name, "loss": float(np.mean(losses)),
                     "val_acc": float(acc), "val_f1": float(f1), "min": dt/60})
         torch.save(model.state_dict(), os.path.join(run_dir, "last.pt"))
         if f1 >= best_f1:

@@ -761,6 +761,21 @@ def main():
     run_dir = os.path.join(RUNS, args.model + ("-scratch" if args.scratch else "") + f"_{args.frames}f"
                             + (f"_{tag}" if tag else ""))
     os.makedirs(run_dir, exist_ok=True)
+    run_name = os.path.basename(run_dir)
+    # meta.json: identifica la corrida (modelo/frames/tag/hparams) de forma
+    # autocontenida en la propia carpeta -- pedido explicito tras perder el
+    # log.json de large-16f (sobreescrito por large-32f al compartir
+    # run_dir): si un checkpoint o log se copia/mueve fuera de esta carpeta,
+    # sigue siendo identificable sin tener que adivinar de que corrida vino.
+    # NO se toca el formato de best.pt/last.pt/epN.pt (siguen siendo un
+    # state_dict plano, para no romper la carga en inferencia/yolo2).
+    with open(os.path.join(run_dir, "meta.json"), "w") as f:
+        json.dump({
+            "run_name": run_name, "model": args.model, "frames": args.frames,
+            "scratch": args.scratch, "tag": tag,
+            "hparams": {"bs": args.bs, "accum": args.accum, "lr": args.lr, "loss": args.loss},
+            "creado": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }, f, indent=1)
 
     items = load_index()
     tr = [i for i in items if i["split"] == "train"]
@@ -898,7 +913,7 @@ def main():
         print("evaluando modelo BASE (sin entrenar) para tener una referencia...", flush=True)
         auc0, ap0, _, _ = evaluate(model, dl_va, device)
         print(f"ep 0/{args.epochs} (BASELINE, sin entrenar)  val_auc {auc0:.4f}  val_ap {ap0:.4f}", flush=True)
-        log.append({"ep": 0, "loss": None, "val_auc": float(auc0), "val_ap": float(ap0), "min": 0.0})
+        log.append({"ep": 0, "run": run_name, "loss": None, "val_auc": float(auc0), "val_ap": float(ap0), "min": 0.0})
         json.dump(log, open(os.path.join(run_dir, "log.json"), "w"), indent=1)
         best_auc = auc0
         epochs_sin_mejora = 0
@@ -940,7 +955,7 @@ def main():
         dt = time.time() - t0
         print(f"ep {ep+1}/{args.epochs} loss {np.mean(losses):.4f} "
               f"val_auc {auc:.4f} val_ap {ap_:.4f} ({dt/60:.1f} min)", flush=True)
-        log.append({"ep": ep+1, "loss": float(np.mean(losses)),
+        log.append({"ep": ep+1, "run": run_name, "loss": float(np.mean(losses)),
                     "val_auc": float(auc), "val_ap": float(ap_), "min": dt/60})
         torch.save(model.state_dict(), os.path.join(run_dir, "last.pt"))
         torch.save(model.state_dict(), os.path.join(run_dir, f"ep{ep+1}.pt"))
