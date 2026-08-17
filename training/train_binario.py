@@ -314,6 +314,44 @@ def _remapea_sd_a_formato_nuevo(sd):
     return nuevo
 
 
+def _adapta_sd_al_entorno(sd, model, etiqueta=""):
+    """Convierte un state_dict propio (guardado por este mismo script, en
+    checkpoints normales o dentro de resume_state.pt) al formato de bias de
+    atencion que espera `model` EN ESTE ENTORNO -- necesario para mover un
+    checkpoint/resume_state.pt entre maquinas con distinta version de
+    transformers (ej. VM con transformers>=5.x -> local con transformers
+    viejo, o al reves). Bidireccional, a diferencia de _remapea_bias_atencion
+    (que solo va viejo->nuevo porque asume el origen es SIEMPRE un checkpoint
+    de MCG-NJU)."""
+    claves_modelo = set(model.state_dict().keys())
+    modelo_nuevo = _formato_bias_nuevo(claves_modelo)
+    sd_nuevo = _formato_bias_nuevo(sd.keys())
+    if modelo_nuevo and not sd_nuevo:
+        print(f"[{etiqueta}] formato viejo de bias, este entorno usa transformers>=5.x -- "
+              f"remapeado a formato nuevo.", flush=True)
+        return _remapea_sd_a_formato_nuevo(sd)
+    if sd_nuevo and not modelo_nuevo:
+        # Mismo criterio que training/convertir_checkpoint_inferencia.py:
+        # key.bias se descarta (no existe en el formato viejo, validado sin
+        # impacto medible en val_auc/val_ap), query.bias/value.bias vuelven
+        # a q_bias/v_bias.
+        print(f"[{etiqueta}] formato nuevo de bias (transformers>=5.x), este entorno usa "
+              f"el formato viejo -- convertido (key.bias descartado, validado sin impacto "
+              f"medible).", flush=True)
+        convertido = {}
+        for k, v in sd.items():
+            if k.endswith("attention.attention.key.bias"):
+                continue
+            elif k.endswith("attention.attention.query.bias"):
+                convertido[k.replace("query.bias", "q_bias")] = v
+            elif k.endswith("attention.attention.value.bias"):
+                convertido[k.replace("value.bias", "v_bias")] = v
+            else:
+                convertido[k] = v
+        return convertido
+    return sd  # mismo formato en ambos lados, nada que convertir
+
+
 def _carga_videomae_bin_manual(mid, num_labels, num_frames=16):
     """Bypass del bloqueo de transformers a torch.load para checkpoints que
     SOLO traen pytorch_model.bin (no model.safetensors) -- caso real:
@@ -708,8 +746,20 @@ def main():
     # confirmado en vivo (large-32f sobreescribiendo el run_dir de large-16f
     # mientras corria, tuvieron que rescatarse best.pt/last.pt a mano antes
     # de que la nueva corrida llegara a su propio primer save).
+    # --tag por defecto: si no se especifico y esto NO es un --resume (que
+    # necesita encontrar el run_dir EXACTO de la corrida original), se genera
+    # uno con fecha/hora -- asi CUALQUIER corrida nueva (no solo el caso ya
+    # conocido de mismo --model a distinto --frames) cae siempre en un
+    # run_dir unico, sin importar que se repitan --model/--frames/--tag por
+    # accidente o a proposito. Pedido explicito tras encontrar la colision
+    # de large-16f/large-32f -- esa vez el sufijo de frames alcanzo, pero no
+    # cubre el caso de lanzar el MISMO --model/--frames dos veces.
+    tag = args.tag
+    if not tag and not args.resume:
+        tag = time.strftime("%Y%m%d_%H%M%S")
+        print(f"[run_dir] --tag no especificado, generando uno por fecha/hora: {tag}", flush=True)
     run_dir = os.path.join(RUNS, args.model + ("-scratch" if args.scratch else "") + f"_{args.frames}f"
-                            + (f"_{args.tag}" if args.tag else ""))
+                            + (f"_{tag}" if tag else ""))
     os.makedirs(run_dir, exist_ok=True)
 
     items = load_index()
@@ -722,13 +772,22 @@ def main():
 
     if args.init_checkpoint:
         sd = torch.load(args.init_checkpoint, map_location="cpu", weights_only=True)
-        sd.pop("m.classifier.weight", None)
-        sd.pop("m.classifier.bias", None)
+        sd = _adapta_sd_al_entorno(sd, model, etiqueta="init-checkpoint")
+        sd_model = model.state_dict()
+        cabeza_coincide = ("m.classifier.weight" in sd and
+                            sd["m.classifier.weight"].shape == sd_model["m.classifier.weight"].shape)
+        if not cabeza_coincide:
+            sd.pop("m.classifier.weight", None)
+            sd.pop("m.classifier.bias", None)
         missing, unexpected = model.load_state_dict(sd, strict=False)
         assert set(missing) <= {"m.classifier.weight", "m.classifier.bias"}, f"missing inesperado: {missing}"
         assert not unexpected, f"unexpected: {unexpected}"
-        print(f"[init-checkpoint] {args.init_checkpoint} -- backbone cargado, "
-              f"cabeza (m.classifier.*) reinicializada random (desajuste de shape esperado)")
+        if cabeza_coincide:
+            print(f"[init-checkpoint] {args.init_checkpoint} -- backbone Y cabeza cargados "
+                  f"(mismo shape, se preserva la cabeza ya entrenada)")
+        else:
+            print(f"[init-checkpoint] {args.init_checkpoint} -- backbone cargado, "
+                  f"cabeza (m.classifier.*) reinicializada random (desajuste de shape esperado)")
 
     model.to(device)
 
@@ -797,14 +856,38 @@ def main():
             raise SystemExit(f"--resume: --epochs ({args.epochs}) tiene que ser MAYOR a las epocas "
                               f"ya completadas ({ck['epoch']}) -- --epochs es el TOTAL final de la "
                               f"corrida completa, no 'epocas de mas'.")
-        model.load_state_dict(ck["model"])
-        opt.load_state_dict(ck["opt"])
-        sched.load_state_dict(ck["sched"])
-        scaler.load_state_dict(ck["scaler"])
+        # Formato de bias distinto entre donde se guardo resume_state.pt y
+        # este entorno (ej. VM con transformers>=5.x -> local viejo): los
+        # PESOS se pueden convertir (_adapta_sd_al_entorno), pero el
+        # optimizador NO -- el formato nuevo tiene query/key/value.bias (3
+        # parametros entrenables por capa) contra q_bias/v_bias del formato
+        # viejo (2 por capa), asi que opt.load_state_dict() falla con
+        # "parameter group que no coincide en tamano" (confirmado en vivo).
+        # En ese caso el resume queda PARCIAL: pesos + log + contador de
+        # epocas se preservan, pero optimizador/scheduler arrancan de cero
+        # (con un OneCycleLR nuevo dimensionado solo para las epocas que
+        # faltan) -- se pierde el momentum exacto de Adam y la posicion en
+        # el ciclo de LR, no es un resume identico, pero es la unica forma
+        # de continuar el entrenamiento cruzando de maquina.
+        cruza_entorno = _formato_bias_nuevo(ck["model"].keys()) != _formato_bias_nuevo(model.state_dict().keys())
+        sd_resume = _adapta_sd_al_entorno(ck["model"], model, etiqueta="resume")
+        model.load_state_dict(sd_resume)
+        start_ep = ck["epoch"]
+        if cruza_entorno:
+            epochs_restantes = args.epochs - start_ep
+            total_steps_restante = max(steps_ep * epochs_restantes, 20)
+            sched = torch.optim.lr_scheduler.OneCycleLR(
+                opt, max_lr=args.lr, total_steps=total_steps_restante, pct_start=0.1)
+            print(f"[resume] CRUCE DE ENTORNO detectado (formato de bias distinto) -- pesos "
+                  f"cargados, pero optimizador/scheduler arrancan de cero (OneCycleLR nuevo para "
+                  f"las {epochs_restantes} epocas restantes). No es un resume identico.", flush=True)
+        else:
+            opt.load_state_dict(ck["opt"])
+            sched.load_state_dict(ck["sched"])
+            scaler.load_state_dict(ck["scaler"])
         log = ck["log"]
         best_auc = ck["best_auc"]
         epochs_sin_mejora = ck["epochs_sin_mejora"]
-        start_ep = ck["epoch"]
         auc0 = log[0]["val_auc"]
         print(f"[resume] retomado desde epoca {start_ep} (best_auc={best_auc:.4f}), "
               f"corriendo hasta epoca {args.epochs}", flush=True)

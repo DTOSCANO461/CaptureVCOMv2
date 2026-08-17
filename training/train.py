@@ -419,13 +419,21 @@ def main():
     ap.add_argument("--boost-clase4", type=float, default=1.0,
                      help="multiplicador extra sobre el peso del sampler para label==4 (robo), "
                           "encima del balanceo por frecuencia inversa que ya hace parejo a todas las clases")
+    ap.add_argument("--tag", default="",
+                     help="Sufijo libre para el run_dir. Si se deja vacio, se genera uno con "
+                          "fecha/hora -- este script no tiene --resume, asi que cada corrida es "
+                          "siempre nueva y nunca deberia pisar el run_dir de otra (mismo criterio "
+                          "que train_binario.py, ver ese archivo para el detalle del bug que motivo esto).")
     args = ap.parse_args()
 
     torch.manual_seed(0)
     random.seed(0)
     np.random.seed(0)
     device = "cuda"
-    run_dir = os.path.join(RUNS, f"{args.model}_{args.frames}f")
+    tag = args.tag or time.strftime("%Y%m%d_%H%M%S")
+    if not args.tag:
+        print(f"[run_dir] --tag no especificado, generando uno por fecha/hora: {tag}", flush=True)
+    run_dir = os.path.join(RUNS, f"{args.model}_{args.frames}f_{tag}")
     os.makedirs(run_dir, exist_ok=True)
 
     items = load_index()
